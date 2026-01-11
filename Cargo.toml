@@ -1,0 +1,13 @@
+[package]
+name = "clockwork"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flume = "0.11"
+futures = "0.3"
+slab = "0.4"
+static_assertions = "1.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "rt", "macros"] }
