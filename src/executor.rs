@@ -78,7 +78,7 @@ struct TaskRecord {
 
 /// Global per-queue state maintained by the executor (vruntime/shares).
 struct QueueState {
-    total_cpu_nanos: u128, // total CPU time consumed (in nanoseconds)
+    vruntime: u128, // total CPU time consumed (in nanoseconds)
     share: u64,
     scheduler: Box<dyn Scheduler>,
 }
@@ -86,7 +86,7 @@ struct QueueState {
 impl QueueState {
     fn new(queue: Queue) -> Self {
         Self {
-            total_cpu_nanos: 0,
+            vruntime: 0,
             share: queue.share(),
             scheduler: queue.scheduler(),
         }
@@ -207,11 +207,9 @@ impl Executor {
             }
             // Compute vruntime = total_cpu_nanos / weight
             // Higher weight => lower vruntime for same CPU time => preferred
-            // TODO: don't compute vruntime here
-            let vruntime = q.total_cpu_nanos / (q.share as u128);
             match best {
-                None => best = Some((idx, vruntime)),
-                Some((_, bv)) if vruntime < bv => best = Some((idx, vruntime)),
+                None => best = Some((idx, q.vruntime)),
+                Some((_, bv)) if q.vruntime < bv => best = Some((idx, q.vruntime)),
                 _ => {}
             }
         }
@@ -224,7 +222,8 @@ impl Executor {
     fn charge_class(&self, qidx: usize, elapsed: Duration) {
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[qidx];
-        queue.total_cpu_nanos = queue.total_cpu_nanos.saturating_add(elapsed.as_nanos());
+        // ceil of (elapsed / share)
+        queue.vruntime += (elapsed.as_nanos() + queue.share as u128 - 1) / (queue.share as u128);
     }
 
     /// Run the executor loop forever.
