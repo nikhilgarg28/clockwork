@@ -8,7 +8,6 @@ pub struct Queue {
     share: u64,
     scheduler: Box<dyn Scheduler>,
 }
-#[allow(dead_code)]
 impl Queue {
     pub fn new<ID>(id: ID, share: u64, scheduler: Box<dyn Scheduler>) -> Self
     where

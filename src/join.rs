@@ -75,7 +75,6 @@ pub struct JoinHandle<T> {
     join: Arc<JoinState<T>>,
 }
 
-#[allow(dead_code)]
 impl<T> JoinHandle<T> {
     pub fn new(header: Arc<TaskHeader>, join: Arc<JoinState<T>>) -> Self {
         Self { header, join }

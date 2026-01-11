@@ -4,4 +4,7 @@ mod yield_once;
 mod join;
 mod queue;
 mod task;
-pub use queue::{FifoQueue, Scheduler};
+
+pub use executor::{yield_maybe, Executor};
+pub use join::{JoinError, JoinHandle};
+pub use queue::{FifoQueue, Queue, Scheduler};

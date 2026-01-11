@@ -9,15 +9,24 @@ use futures::task::waker;
 use slab::Slab;
 use static_assertions::assert_not_impl_any;
 use std::{
+    cell::Cell,
     cell::RefCell,
     collections::HashSet,
     future::Future,
     pin::Pin,
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+thread_local! {
+    static YIELD_MAYBE_DEADLINE: Cell<Option<Instant>> = Cell::new(None);
+}
+
+fn set_yield_maybe_deadline(deadline: Instant) {
+    YIELD_MAYBE_DEADLINE.with(|cell| cell.set(Some(deadline)));
+}
 
 /// Wraps a user given future to make it cancelable
 /// This future only returns () - when the underlying future completes,
@@ -93,7 +102,6 @@ impl QueueState {
     }
 }
 /// The priority executor: single-thread polling + class vruntime selection.
-#[allow(dead_code)]
 pub struct Executor {
     ingress_tx: Sender<TaskId>,
     ingress_rx: Receiver<TaskId>,
@@ -105,11 +113,11 @@ pub struct Executor {
     sched_latency: Duration,
     min_slice: Duration,
     driver_yield: Duration,
-    min_vruntime: u128,
+    min_vruntime: std::cell::Cell<u128>,
+    num_driver_yields: AtomicU64,
 }
 assert_not_impl_any!(Executor: Send, Sync);
 
-#[allow(dead_code)]
 impl Executor {
     /// Create an executor with N classes, each with a weight (share).
     pub fn new(queues: Vec<Queue>) -> Result<Rc<Self>, String> {
@@ -117,6 +125,10 @@ impl Executor {
         let queue_ids = queues.iter().map(|q| q.id()).collect::<HashSet<_>>();
         if queue_ids.len() != queues.len() {
             return Err("All queues must have unique ids".to_string());
+        }
+        // no share can be 0
+        if queues.iter().any(|q| q.share() == 0) {
+            return Err("All queues must have a share > 0".to_string());
         }
 
         let (tx, rx) = flume::unbounded::<TaskId>();
@@ -137,7 +149,8 @@ impl Executor {
             sched_latency: Duration::from_millis(2),
             min_slice: Duration::from_micros(100),
             driver_yield: Duration::from_micros(500),
-            min_vruntime: 0,
+            min_vruntime: std::cell::Cell::new(0),
+            num_driver_yields: AtomicU64::new(0),
         }))
     }
 
@@ -192,28 +205,44 @@ impl Executor {
         };
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[idx];
+        let is_runnable = queue.scheduler.is_runnable();
         queue.scheduler.push(id);
+        // this queue just became runnable, so update its vruntime
+        if !is_runnable && queue.scheduler.is_runnable() {
+            queue.vruntime = queue.vruntime.max(self.min_vruntime.get());
+        }
     }
 
-    /// Pick the next runnable class by min vruntime among classes that have runnable tasks.
-    /// Vruntime is computed as total_cpu_nanos / weight, so higher weight classes
-    /// have lower vruntime for the same CPU time, making them preferred.
-    fn pick_next_class(&self) -> Option<usize> {
+    /// Pick the next runnable class by deadline among classes that have
+    /// runnable tasks. Deadline is vruntime + sched_latency / num_runnable,
+    /// so higher weight classes
+    /// have lower deadline for the same CPU time, making them preferred.
+    fn pick_next_class(&self) -> Option<(usize, Duration)> {
         let mut best: Option<(usize, u128)> = None;
-
+        let num_runnable = self
+            .queues
+            .borrow()
+            .iter()
+            .filter(|q| q.scheduler.is_runnable())
+            .count();
+        if num_runnable == 0 {
+            return None;
+        }
+        let request = self.sched_latency.as_nanos() as u128 / num_runnable as u128;
+        let request = request.max(self.min_slice.as_nanos() as u128);
         for (idx, q) in self.queues.borrow().iter().enumerate() {
             if !q.scheduler.is_runnable() {
                 continue;
             }
-            // Compute vruntime = total_cpu_nanos / weight
-            // Higher weight => lower vruntime for same CPU time => preferred
+            // d_i = vruntime_i + request / share_i
+            let deadline = q.vruntime + (request / q.share as u128);
             match best {
-                None => best = Some((idx, q.vruntime)),
-                Some((_, bv)) if q.vruntime < bv => best = Some((idx, q.vruntime)),
+                None => best = Some((idx, deadline)),
+                Some((_, bv)) if deadline < bv => best = Some((idx, deadline)),
                 _ => {}
             }
         }
-        best.map(|(i, _)| i)
+        best.map(|(i, _)| (i, Duration::from_nanos(request as u64)))
     }
 
     /// Charge elapsed CPU time to a class.
@@ -223,7 +252,22 @@ impl Executor {
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[qidx];
         // ceil of (elapsed / share)
-        queue.vruntime += (elapsed.as_nanos() + queue.share as u128 - 1) / (queue.share as u128);
+        let incr = (elapsed.as_nanos() + queue.share as u128 - 1) / (queue.share as u128);
+        queue.vruntime += incr;
+    }
+    fn update_min_vruntime(&self, including: u128) {
+        let min_vruntime = self
+            .queues
+            .borrow()
+            .iter()
+            .filter(|q| q.scheduler.is_runnable())
+            .map(|q| q.vruntime)
+            .chain(Some(including))
+            .min();
+        let min_vruntime = min_vruntime.unwrap();
+        // update executor's min_vruntime
+        let prev_min_vruntime = self.min_vruntime.get();
+        self.min_vruntime.set(prev_min_vruntime.max(min_vruntime));
     }
 
     /// Run the executor loop forever.
@@ -249,90 +293,116 @@ impl Executor {
                 }
             }
             // Choose class, then choose task within class.
-            let qidx = self.pick_next_class().expect("checked runnable");
-            let mut maybe_task = {
-                let mut queues = self.queues.borrow_mut();
-                let queue = &mut queues[qidx];
-                queue.scheduler.pop()
-            };
-
-            // Skip dead/stale tasks if policy had tombstones or late notifications.
-            let id = loop {
-                let Some(id) = maybe_task else {
-                    // Class became empty; re-loop.
-                    break None;
+            let (qidx, timeslice) = self.pick_next_class().expect("checked runnable");
+            let timeslice = timeslice.min(self.driver_yield);
+            let class_end = Instant::now() + timeslice;
+            'timeslice: loop {
+                set_yield_maybe_deadline(class_end);
+                let mut maybe_task = {
+                    let mut queues = self.queues.borrow_mut();
+                    let queue = &mut queues[qidx];
+                    queue.scheduler.pop()
                 };
-                let tasks = self.tasks.borrow();
-                let Some(task) = tasks.get(id) else {
-                    // Stale id; pick again from same class.
-                    drop(tasks);
-                    maybe_task = self
-                        .queues
-                        .borrow_mut()
-                        .get_mut(qidx)
-                        .unwrap()
-                        .scheduler
-                        .pop();
-                    continue;
+
+                // Skip dead/stale tasks if policy had tombstones or late notifications.
+                let id = loop {
+                    let Some(id) = maybe_task else {
+                        // Class became empty; re-loop.
+                        break None;
+                    };
+                    let tasks = self.tasks.borrow();
+                    let Some(task) = tasks.get(id) else {
+                        // Stale id; pick again from same class.
+                        drop(tasks);
+                        maybe_task = self
+                            .queues
+                            .borrow_mut()
+                            .get_mut(qidx)
+                            .unwrap()
+                            .scheduler
+                            .pop();
+                        continue;
+                    };
+                    if task.header.is_done() {
+                        // this is spurious task - we have already done cleanup
+                        // before so nothing to do here
+                        drop(tasks);
+                        let mut queues = self.queues.borrow_mut();
+                        let queue = &mut queues[qidx];
+                        maybe_task = queue.scheduler.pop();
+                        continue;
+                    }
+                    break Some(id);
                 };
-                if task.header.is_done() {
-                    // this is spurious task - we have already done cleanup
-                    // before so nothing to do here
-                    drop(tasks);
-                    let mut queues = self.queues.borrow_mut();
-                    let queue = &mut queues[qidx];
-                    maybe_task = queue.scheduler.pop();
-                    continue;
+
+                let Some(id) = id else {
+                    break 'timeslice;
+                };
+
+                // Poll the task once.
+                let start = Instant::now();
+                let mut tasks = self.tasks.borrow_mut();
+                let Some(task) = tasks.get_mut(id) else {
+                    continue 'timeslice;
+                };
+
+                // Clear queued before polling so a wake during poll can enqueue again.
+                task.header.set_queued(false);
+
+                let w = waker(task.header.clone());
+                let mut cx = Context::from_waker(&w);
+
+                // NOTE: default abort-on-panic is achieved by *not* catching unwind here.
+                let poll = task.fut.as_mut().poll(&mut cx);
+
+                let end = Instant::now();
+                let elapsed = end.saturating_duration_since(start);
+                self.charge_class(qidx, elapsed);
+
+                match poll {
+                    Poll::Ready(()) => {
+                        task.header.set_done();
+                        tasks.remove(id);
+                        let mut queues = self.queues.borrow_mut();
+                        let queue = &mut queues[qidx];
+                        queue.scheduler.clear_state(id);
+                        queue.scheduler.record(id, start, end, true);
+                    }
+                    // Task is still running, nothing to do.
+                    Poll::Pending => {
+                        let mut queues = self.queues.borrow_mut();
+                        let queue = &mut queues[qidx];
+                        queue.scheduler.record(id, start, end, false);
+                    }
+                };
+                if end > class_end {
+                    break 'timeslice;
                 }
-                break Some(id);
-            };
-
-            let Some(id) = id else {
-                continue;
-            };
-
-            // Poll the task once.
-            let start = Instant::now();
-
-            // Single-thread local access to the future.
-            let mut tasks = self.tasks.borrow_mut();
-            let Some(task) = tasks.get_mut(id) else {
-                continue;
-            };
-
-            // Clear queued before polling so a wake during poll can enqueue again.
-            task.header.set_queued(false);
-
-            let w = waker(task.header.clone());
-            let mut cx = Context::from_waker(&w);
-
-            // NOTE: default abort-on-panic is achieved by *not* catching unwind here.
-            let poll = task.fut.as_mut().poll(&mut cx);
-
-            let end = Instant::now();
-            let elapsed = end.saturating_duration_since(start);
-            self.charge_class(qidx, elapsed);
-
-            match poll {
-                Poll::Ready(()) => {
-                    task.header.set_done();
-                    tasks.remove(id);
-                    let mut queues = self.queues.borrow_mut();
-                    let queue = &mut queues[qidx];
-                    queue.scheduler.clear_state(id);
-                    queue.scheduler.record(id, start, end, true);
-                }
-                // Task is still running, nothing to do.
-                Poll::Pending => {
-                    let mut queues = self.queues.borrow_mut();
-                    let queue = &mut queues[qidx];
-                    queue.scheduler.record(id, start, end, false);
-                }
-            };
+            }
+            // compute new min vruntime - note that qid may not be runnable
+            // anymore but we do want to include it in the computation
+            let new_vruntime = self.queues.borrow()[qidx].vruntime;
+            self.update_min_vruntime(new_vruntime);
 
             // Give the underlying runtime a chance to run its drivers.
             yield_once().await;
+            self.num_driver_yields.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+pub async fn yield_maybe() {
+    let should_yield = YIELD_MAYBE_DEADLINE.with(|d| {
+        if let Some(dl) = d.get() {
+            Instant::now() >= dl
+        } else {
+            false
+        }
+    });
+    if should_yield {
+        // clear so we don't yield repeatedly in a tight loop
+        YIELD_MAYBE_DEADLINE.with(|d| d.set(None));
+        yield_once().await;
     }
 }
 
@@ -477,17 +547,21 @@ mod tests {
                 // Spawn tasks that run indefinitely with some work per iteration.
                 // Note: We use yield_once() instead of sleep() because sleep() makes tasks
                 // pending (not runnable), so they can't compete for CPU, thus
-                // giving low weight class access to the CPU when the hight weight
+                // giving low weight class access to the CPU when high weight
                 // class is not runnable.
                 let handle1 = executor.spawn(0, async move {
                     loop {
-                        high_clone.fetch_add(1, Ordering::Relaxed);
+                        for _ in 0..100_000 {
+                            high_clone.fetch_add(1, Ordering::Relaxed);
+                        }
                         yield_once().await;
                     }
                 });
                 let handle2 = executor.spawn(1, async move {
                     loop {
-                        low_clone.fetch_add(1, Ordering::Relaxed);
+                        for _ in 0..100_000 {
+                            low_clone.fetch_add(1, Ordering::Relaxed);
+                        }
                         yield_once().await;
                     }
                 });
@@ -765,6 +839,91 @@ mod tests {
                     yield_once().await;
                 });
                 sleep(Duration::from_millis(100)).await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_vruntime_resets() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let executor = Executor::new(vec![
+                    Queue::new(0, 1, Box::new(FifoQueue::new())),
+                    Queue::new(1, 1, Box::new(FifoQueue::new())),
+                ])
+                .unwrap();
+                let counter = Arc::new(AtomicU32::new(0));
+                let counter_clone = counter.clone();
+                let _ = executor.spawn(0, async move {
+                    for _ in 0..1000 {
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                        yield_once().await;
+                    }
+                });
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+                sleep(Duration::from_millis(100)).await;
+                assert_eq!(counter.load(Ordering::Relaxed), 1000);
+                let vruntime1 = executor.queues.borrow()[0].vruntime;
+                assert!(vruntime1 > 0);
+                // now spawn a task in the second queue
+                let counter_clone = counter.clone();
+                let _ = executor.spawn(1, async move {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                });
+                sleep(Duration::from_millis(100)).await;
+                assert_eq!(counter.load(Ordering::Relaxed), 1001);
+                let vruntime2 = executor.queues.borrow()[1].vruntime;
+                // even though the second task only ran for a short time
+                // its vruntime should have "inherited" the vruntime of the
+                // first queue when it started running
+                assert!(
+                    vruntime2 > vruntime1,
+                    "vruntime2 should be greater than vruntime1, got {} and {}",
+                    vruntime2,
+                    vruntime1
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_yield_maybe() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let queue = Queue::new(0, 1, Box::new(FifoQueue::new()));
+                let executor = Executor::new(vec![queue]).unwrap();
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+                let counter1 = Arc::new(AtomicU32::new(0));
+                let counter1_clone = counter1.clone();
+                let handle = executor
+                    .spawn(0, async move {
+                        let mut i = 0;
+                        loop {
+                            counter1_clone.fetch_add(1, Ordering::Relaxed);
+                            if i % 1000 == 0 {
+                                yield_maybe().await;
+                            }
+                            i += 1;
+                        }
+                    })
+                    .unwrap();
+                sleep(Duration::from_millis(100)).await;
+                let count = counter1.load(Ordering::Relaxed);
+                assert!(count > 0);
+                let yields = executor.num_driver_yields.load(Ordering::Relaxed);
+                assert!(yields > 0);
+                // we have yielded at most half the time (in practice much
+                // much less)
+                assert!(yields < count as u64 / 1000 / 2);
+                handle.abort();
             })
             .await;
     }
