@@ -1,6 +1,7 @@
 use crate::{
     join::{JoinHandle, JoinState},
-    queue::{Queue, QueueKey, Scheduler, TaskId},
+    queue::{Queue, QueueKey, TaskId},
+    scheduler::Scheduler,
     stats::{ExecutorStats, QueueStats},
     task::TaskHeader,
     yield_once::yield_once,
@@ -393,7 +394,7 @@ impl<K: QueueKey> Executor<K> {
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[idx];
         let was_runnable = queue.scheduler.is_runnable();
-        queue.scheduler.push(id, task.header.group());
+        queue.scheduler.push(id, task.header.group(), now);
         let now_runnable = queue.scheduler.is_runnable();
         let became_runnable = !was_runnable && now_runnable;
         // this queue just became runnable, so update its vruntime
@@ -617,6 +618,7 @@ impl<K: QueueKey> Executor<K> {
     fn complete_task(&self, id: TaskId, qidx: usize, start: Instant, end: Instant) {
         let mut tasks = self.tasks.borrow_mut();
         let task = tasks.get_mut(id).expect("task should exist");
+        let group = task.header.group();
         task.header.set_done();
         tasks.remove(id);
 
@@ -624,15 +626,21 @@ impl<K: QueueKey> Executor<K> {
 
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[qidx];
-        queue.scheduler.clear_state(id);
-        queue.scheduler.observe(id, start, end, true);
+        queue.scheduler.clear_task_state(id, group);
+        if group & (1 << 63) == 0 {
+            queue.scheduler.clear_group_state(group);
+        }
+        queue.scheduler.observe(id, group, start, end, true);
     }
 
     /// Record that a task is still pending.
     fn record_task_pending(&self, id: TaskId, qidx: usize, start: Instant, end: Instant) {
+        let mut tasks = self.tasks.borrow_mut();
+        let task = tasks.get_mut(id).expect("task should exist");
+        let group = task.header.group();
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[qidx];
-        queue.scheduler.observe(id, start, end, false);
+        queue.scheduler.observe(id, group, start, end, false);
     }
 
     /// Execute tasks from a selected queue until the timeslice is exhausted.
@@ -708,8 +716,7 @@ pub async fn yield_maybe() {
 mod tests {
     use super::*;
     use crate::join::JoinError;
-    use crate::queue::FifoQueue;
-    use crate::queue::Scheduler;
+    use crate::scheduler::RunnableFifo;
     use crate::yield_once::yield_once;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -723,7 +730,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
                 let counter_clone = counter.clone();
@@ -754,7 +761,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
 
                 let queue = executor.queue(0).unwrap();
                 let handle = queue.spawn(async move { 42 });
@@ -778,7 +785,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let started = Arc::new(AtomicBool::new(false));
                 let completed = Arc::new(AtomicBool::new(false));
 
@@ -833,8 +840,8 @@ mod tests {
         local
             .run_until(async {
                 let executor = Executor::new(vec![
-                    Queue::new(0, 8, Box::new(FifoQueue::new())),
-                    Queue::new(1, 1, Box::new(FifoQueue::new())),
+                    Queue::new(0, 8, Box::new(RunnableFifo::new())),
+                    Queue::new(1, 1, Box::new(RunnableFifo::new())),
                 ])
                 .unwrap();
                 let high = Arc::new(AtomicU32::new(0));
@@ -892,7 +899,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let queue = executor.queue(0).unwrap();
                 let execution_order = Arc::new(Mutex::new(Vec::new()));
 
@@ -930,7 +937,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let queue = executor.queue(0).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
@@ -966,7 +973,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let queue = executor.queue(0).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
@@ -1007,11 +1014,12 @@ mod tests {
         }
 
         impl Scheduler for Tracker {
-            fn push(&mut self, id: TaskId, group: u64) {
+            fn push(&mut self, id: TaskId, group: u64, _at: Instant) {
                 self.ids.push(id);
                 self.enqueued.lock().unwrap().push((group, id));
             }
-            fn clear_state(&mut self, _id: TaskId) {}
+            fn clear_task_state(&mut self, _id: TaskId, _group: u64) {}
+            fn clear_group_state(&mut self, _group: u64) {}
 
             fn pop(&mut self) -> Option<TaskId> {
                 // pick largest id
@@ -1026,7 +1034,14 @@ mod tests {
                 !self.ids.is_empty()
             }
 
-            fn observe(&mut self, id: TaskId, _start: Instant, _end: Instant, ready: bool) {
+            fn observe(
+                &mut self,
+                id: TaskId,
+                _gid: u64,
+                _start: Instant,
+                _end: Instant,
+                ready: bool,
+            ) {
                 self.picked.lock().unwrap().push((id, ready));
             }
         }
@@ -1082,7 +1097,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let queue = executor.queue(0).unwrap();
                 let executed = Arc::new(AtomicBool::new(false));
 
@@ -1129,8 +1144,8 @@ mod tests {
         local
             .run_until(async {
                 let executor = Executor::new(vec![
-                    Queue::new(QueueId::High, 1, Box::new(FifoQueue::new())),
-                    Queue::new(QueueId::Low, 1, Box::new(FifoQueue::new())),
+                    Queue::new(QueueId::High, 1, Box::new(RunnableFifo::new())),
+                    Queue::new(QueueId::Low, 1, Box::new(RunnableFifo::new())),
                 ])
                 .unwrap();
                 let high = Arc::new(AtomicU32::new(0));
@@ -1164,8 +1179,8 @@ mod tests {
         local
             .run_until(async {
                 let executor = Executor::new(vec![
-                    Queue::new(0, 1, Box::new(FifoQueue::new())),
-                    Queue::new(1, 1, Box::new(FifoQueue::new())),
+                    Queue::new(0, 1, Box::new(RunnableFifo::new())),
+                    Queue::new(1, 1, Box::new(RunnableFifo::new())),
                 ])
                 .unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
@@ -1213,7 +1228,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let queue = executor.queue(0).unwrap();
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
@@ -1249,7 +1264,7 @@ mod tests {
     // Test with smol runtime
     #[test]
     fn test_smol_runtime() {
-        let queue = Queue::new(0, 1, Box::new(FifoQueue::new()));
+        let queue = Queue::new(0, 1, Box::new(RunnableFifo::new()));
         let executor = Executor::new(vec![queue]).unwrap();
         let executor_clone = executor.clone();
         let smol_local_ex = smol::LocalExecutor::new();
@@ -1276,7 +1291,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
                     executor_clone.run().await;
@@ -1309,7 +1324,7 @@ mod tests {
             .build()
             .unwrap();
         let _ = rt.block_on(async move {
-            let queue = Queue::new(0, 1, Box::new(FifoQueue::new()));
+            let queue = Queue::new(0, 1, Box::new(RunnableFifo::new()));
             let executor = Executor::new(vec![queue]).unwrap();
             let counter = Arc::new(AtomicU32::new(0));
 
@@ -1346,7 +1361,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
                     executor_clone.run().await;
@@ -1390,7 +1405,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
                     executor_clone.run().await;
@@ -1447,7 +1462,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                    Executor::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))]).unwrap();
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
                     executor_clone.run().await;
@@ -1490,12 +1505,12 @@ mod tests {
     #[test]
     fn test_bad_executor_creation() {
         // can't create executor with 0 shares
-        let result = Executor::new(vec![Queue::new(0, 0, Box::new(FifoQueue::new()))]);
+        let result = Executor::new(vec![Queue::new(0, 0, Box::new(RunnableFifo::new()))]);
         assert!(result.is_err());
         // can't create executor with duplicate queue IDs
         let result = Executor::new(vec![
-            Queue::new(0, 1, Box::new(FifoQueue::new())),
-            Queue::new(0, 1, Box::new(FifoQueue::new())),
+            Queue::new(0, 1, Box::new(RunnableFifo::new())),
+            Queue::new(0, 1, Box::new(RunnableFifo::new())),
         ]);
         assert!(result.is_err());
         // can't create executor with 0 queues
@@ -1509,7 +1524,7 @@ mod tests {
         local
             .run_until(async {
                 let executor =
-                    Executor::<u8>::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))])
+                    Executor::<u8>::new(vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
                         .unwrap();
                 let queue = executor.queue(0).unwrap();
                 let handle = tokio::task::spawn_local(async move {
