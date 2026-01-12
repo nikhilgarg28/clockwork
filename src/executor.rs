@@ -253,6 +253,9 @@ assert_not_impl_any!(Executor<u8>: Send, Sync);
 impl<K: QueueKey> Executor<K> {
     /// Create an executor with N classes, each with a weight (share).
     pub fn new(queues: Vec<Queue<K>>) -> Result<Rc<Self>, String> {
+        if queues.is_empty() {
+            return Err("Must have at least one queue".to_string());
+        }
         // verify that all queues have unique ids
         for i in 0..queues.len() {
             for j in i + 1..queues.len() {
@@ -1480,6 +1483,44 @@ mod tests {
                 let result = timeout(Duration::from_millis(1), task).await;
                 let result = result.unwrap();
                 assert_eq!(result, Ok(42));
+            })
+            .await;
+    }
+
+    #[test]
+    fn test_bad_executor_creation() {
+        // can't create executor with 0 shares
+        let result = Executor::new(vec![Queue::new(0, 0, Box::new(FifoQueue::new()))]);
+        assert!(result.is_err());
+        // can't create executor with duplicate queue IDs
+        let result = Executor::new(vec![
+            Queue::new(0, 1, Box::new(FifoQueue::new())),
+            Queue::new(0, 1, Box::new(FifoQueue::new())),
+        ]);
+        assert!(result.is_err());
+        // can't create executor with 0 queues
+        let result = Executor::<u8>::new(vec![]);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_panic_crashes_executor() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let executor =
+                    Executor::<u8>::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))])
+                        .unwrap();
+                let queue = executor.queue(0).unwrap();
+                let handle = tokio::task::spawn_local(async move {
+                    executor.run().await;
+                });
+                let _ = queue.spawn(async {
+                    panic!("test");
+                });
+                let result = handle.await;
+                assert!(result.is_err());
+                assert!(result.unwrap_err().is_panic());
             })
             .await;
     }
