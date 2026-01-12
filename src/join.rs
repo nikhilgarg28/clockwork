@@ -1,10 +1,9 @@
-use crate::task::TaskHeader;
+use crate::{queue::QueueKey, task::TaskHeader};
 use futures::task::AtomicWaker;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::{
     future::Future,
     pin::Pin,
+    sync::{atomic::Ordering, Arc},
     task::{Context, Poll},
 };
 /// Error returned from awaiting a JoinHandle.
@@ -76,13 +75,13 @@ impl<T> JoinState<T> {
 
 /// A JoinHandle that detaches on drop, and supports explicit abort().
 #[derive(Clone, Debug)]
-pub struct JoinHandle<T> {
-    header: Arc<TaskHeader>,
+pub struct JoinHandle<T, K: QueueKey> {
+    header: Arc<TaskHeader<K>>,
     join: Arc<JoinState<T>>,
 }
 
-impl<T> JoinHandle<T> {
-    pub fn new(header: Arc<TaskHeader>, join: Arc<JoinState<T>>) -> Self {
+impl<T, K: QueueKey> JoinHandle<T, K> {
+    pub fn new(header: Arc<TaskHeader<K>>, join: Arc<JoinState<T>>) -> Self {
         Self { header, join }
     }
     pub fn abort(&self) {
@@ -92,7 +91,7 @@ impl<T> JoinHandle<T> {
     }
 }
 
-impl<T> Future for JoinHandle<T> {
+impl<T, K: QueueKey> Future for JoinHandle<T, K> {
     type Output = Result<T, JoinError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

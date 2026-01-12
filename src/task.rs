@@ -1,4 +1,4 @@
-use crate::queue::TaskId;
+use crate::queue::{QueueKey, TaskId};
 use flume::Sender;
 use futures::task::ArcWake;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 /// Shared, thread-safe header touched by the Waker and JoinHandle.
 #[derive(Debug)]
-pub struct TaskHeader {
+pub struct TaskHeader<K: QueueKey> {
     id: TaskId,
-    qid: u8,
+    qid: K,
     // changes to true when task is enqueued
     // if this flag is true, it's not enqueued again
     queued: AtomicBool,
@@ -23,8 +23,8 @@ pub struct TaskHeader {
     ingress_tx: Sender<TaskId>,
 }
 
-impl TaskHeader {
-    pub fn new(id: TaskId, qid: u8, ingress_tx: Sender<TaskId>) -> Self {
+impl<K: QueueKey> TaskHeader<K> {
+    pub fn new(id: TaskId, qid: K, ingress_tx: Sender<TaskId>) -> Self {
         Self {
             id,
             qid,
@@ -34,7 +34,7 @@ impl TaskHeader {
             ingress_tx,
         }
     }
-    pub fn qid(&self) -> u8 {
+    pub fn qid(&self) -> K {
         self.qid
     }
     pub fn enqueue(&self) {
@@ -65,7 +65,7 @@ impl TaskHeader {
     }
 }
 
-impl ArcWake for TaskHeader {
+impl<K: QueueKey> ArcWake for TaskHeader<K> {
     fn wake_by_ref(arc_self: &Arc<Self>) {
         arc_self.enqueue();
     }

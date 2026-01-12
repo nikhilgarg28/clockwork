@@ -1,3 +1,4 @@
+use crate::queue::QueueKey;
 use std::time::{Duration, Instant};
 
 /// Fixed log2 histogram for durations in nanoseconds.
@@ -160,8 +161,8 @@ impl ExecutorStats {
 
 /// Per-queue stats
 #[derive(Clone, Debug)]
-pub struct QueueStats {
-    pub id: u8,
+pub struct QueueStats<K: QueueKey> {
+    pub id: K,
 
     // Weight/policy metadata (optional but useful to export)
     pub weight: u64,
@@ -195,8 +196,8 @@ pub struct QueueStats {
     last_serviced_at: Option<Instant>,
 }
 
-impl QueueStats {
-    pub fn new(id: u8, weight: u64) -> Self {
+impl<K: QueueKey> QueueStats<K> {
+    pub fn new(id: K, weight: u64) -> Self {
         Self {
             id,
             weight: weight as u64,

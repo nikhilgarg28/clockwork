@@ -1,6 +1,6 @@
 use crate::{
     join::{JoinHandle, JoinState},
-    queue::{Queue, Scheduler, TaskId},
+    queue::{Queue, QueueKey, Scheduler, TaskId},
     stats::{ExecutorStats, QueueStats},
     task::TaskHeader,
     yield_once::yield_once,
@@ -12,7 +12,6 @@ use static_assertions::assert_not_impl_any;
 use std::{
     cell::Cell,
     cell::RefCell,
-    collections::HashSet,
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -30,26 +29,24 @@ fn set_yield_maybe_deadline(deadline: Instant) {
 }
 
 #[derive(Debug)]
-pub enum SpawnError {
+pub enum SpawnError<K: QueueKey> {
     ShuttingDown,
-    QueueNotFound(u8),
+    QueueNotFound(K),
+    InvalidShare(u64),
 }
 
 /// Wraps a user given future to make it cancelable
 /// This future only returns () - when the underlying future completes,
 /// the result is published to the JoinState, which wrapped by Join Handle
 /// can be awaited by the user.
-struct CancelableFuture<T, F> {
-    header: Arc<TaskHeader>, // has `cancelled: AtomicBool`
+struct CancelableFuture<T, K: QueueKey, F: Future<Output = T> + 'static> {
+    header: Arc<TaskHeader<K>>, // has `cancelled: AtomicBool`
     join: Arc<JoinState<T>>,
     fut: Pin<Box<F>>,
 }
 
-impl<T, F> CancelableFuture<T, F>
-where
-    F: Future<Output = T> + 'static,
-{
-    pub fn new(header: Arc<TaskHeader>, join: Arc<JoinState<T>>, fut: F) -> Self {
+impl<T, K: QueueKey, F: Future<Output = T> + 'static> CancelableFuture<T, K, F> {
+    pub fn new(header: Arc<TaskHeader<K>>, join: Arc<JoinState<T>>, fut: F) -> Self {
         Self {
             header,
             join,
@@ -58,10 +55,7 @@ where
     }
 }
 
-impl<T, F> Future for CancelableFuture<T, F>
-where
-    F: Future<Output = T> + 'static,
-{
+impl<T, K: QueueKey, F: Future<Output = T> + 'static> Future for CancelableFuture<T, K, F> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -87,21 +81,21 @@ where
 }
 
 /// Local (executor-thread-only) task record containing the !Send future.
-struct TaskRecord {
-    header: Arc<TaskHeader>,
+struct TaskRecord<K: QueueKey> {
+    header: Arc<TaskHeader<K>>,
     fut: Pin<Box<dyn Future<Output = ()> + 'static>>, // !Send ok
 }
 
 /// Global per-queue state maintained by the executor (vruntime/shares).
-struct QueueState {
+struct QueueState<K: QueueKey> {
     vruntime: u128, // total CPU time consumed (in nanoseconds)
     share: u64,
     scheduler: Box<dyn Scheduler>,
-    stats: QueueStats,
+    stats: QueueStats<K>,
 }
 
-impl QueueState {
-    fn new(queue: Queue) -> Self {
+impl<K: QueueKey> QueueState<K> {
+    fn new(queue: Queue<K>) -> Self {
         Self {
             vruntime: 0,
             stats: QueueStats::new(queue.id(), queue.share()),
@@ -189,7 +183,7 @@ impl ShutdownHandle {
     }
 }
 /// The priority executor: single-thread polling + class vruntime selection.
-pub struct Executor {
+pub struct Executor<K: QueueKey> {
     ingress_tx: Sender<TaskId>,
     ingress_rx: Receiver<TaskId>,
 
@@ -198,9 +192,9 @@ pub struct Executor {
 
     shutdown: Rc<ShutdownState>,
 
-    tasks: RefCell<Slab<TaskRecord>>,
-    queues: RefCell<Vec<QueueState>>,
-    qids: RefCell<Vec<u8>>,
+    tasks: RefCell<Slab<TaskRecord<K>>>,
+    queues: RefCell<Vec<QueueState<K>>>,
+    qids: RefCell<Vec<K>>,
 
     sched_latency: Duration,
     min_slice: Duration,
@@ -209,15 +203,18 @@ pub struct Executor {
     // stats
     stats: RefCell<ExecutorStats>,
 }
-assert_not_impl_any!(Executor: Send, Sync);
+assert_not_impl_any!(Executor<u8>: Send, Sync);
 
-impl Executor {
+impl<K: QueueKey> Executor<K> {
     /// Create an executor with N classes, each with a weight (share).
-    pub fn new(queues: Vec<Queue>) -> Result<Rc<Self>, String> {
+    pub fn new(queues: Vec<Queue<K>>) -> Result<Rc<Self>, String> {
         // verify that all queues have unique ids
-        let queue_ids = queues.iter().map(|q| q.id()).collect::<HashSet<_>>();
-        if queue_ids.len() != queues.len() {
-            return Err("All queues must have unique ids".to_string());
+        for i in 0..queues.len() {
+            for j in i + 1..queues.len() {
+                if queues[i].id() == queues[j].id() {
+                    return Err("All queues must have unique ids".to_string());
+                }
+            }
         }
         // no share can be 0
         if queues.iter().any(|q| q.share() == 0) {
@@ -226,7 +223,7 @@ impl Executor {
 
         let (tx, rx) = flume::unbounded::<TaskId>();
 
-        let qids = queues.iter().map(|q| q.id() as u8).collect::<Vec<_>>();
+        let qids = queues.iter().map(|q| q.id()).collect::<Vec<_>>();
         let queues = queues
             .into_iter()
             .map(|q| QueueState::new(q))
@@ -249,7 +246,7 @@ impl Executor {
         }))
     }
 
-    fn ensure_accepting(self: &Rc<Self>) -> Result<(), SpawnError> {
+    fn ensure_accepting(self: &Rc<Self>) -> Result<(), SpawnError<K>> {
         if self.shutdown.accepting.get() {
             Ok(())
         } else {
@@ -278,11 +275,10 @@ impl Executor {
 
     /// Spawn onto a class (queue). Returns a JoinHandle that detaches on drop.
     /// Spawn can only be called from the executor thread.
-    pub fn spawn<ID, T, F>(self: &Rc<Self>, qid: ID, fut: F) -> Result<JoinHandle<T>, SpawnError>
+    pub fn spawn<T, F>(self: &Rc<Self>, qid: K, fut: F) -> Result<JoinHandle<T, K>, SpawnError<K>>
     where
         T: 'static,
         F: Future<Output = T> + 'static, // !Send ok
-        ID: Into<u8>,
     {
         let join = Arc::new(JoinState::<T>::new());
 
@@ -329,7 +325,7 @@ impl Executor {
         };
         let qid = task.header.qid();
         let Some(idx) = self.qids.borrow().iter().position(|q| *q == qid) else {
-            unreachable!("Queue not found for id: {}", qid);
+            unreachable!("Queue not found for id: {:?}", qid);
         };
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[idx];
@@ -408,7 +404,7 @@ impl Executor {
     }
 
     /// Get the current queue stats.
-    pub fn qstats(&self) -> Vec<QueueStats> {
+    pub fn qstats(&self) -> Vec<QueueStats<K>> {
         self.queues
             .borrow()
             .iter()
@@ -1000,17 +996,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_enum_queue_ids() {
+        #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
         enum QueueId {
             High,
             Low,
-        }
-        impl Into<u8> for QueueId {
-            fn into(self) -> u8 {
-                match self {
-                    QueueId::High => 0,
-                    QueueId::Low => 1,
-                }
-            }
         }
         let local = LocalSet::new();
         local
@@ -1354,7 +1343,6 @@ mod tests {
                 assert_eq!(executor.num_live_tasks(), 0);
                 // more importantly though the task should have completed
                 assert_eq!(counter.load(Ordering::Relaxed), 3);
-                // now await on task should get the result immediately
                 let result = timeout(Duration::from_millis(1), task).await;
                 let result = result.unwrap();
                 assert_eq!(result, Ok(42));

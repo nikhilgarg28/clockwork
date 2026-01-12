@@ -3,24 +3,23 @@ use std::time::Instant;
 
 pub type TaskId = usize;
 
-pub struct Queue {
-    id: u8,
+pub trait QueueKey: Eq + Sized + Copy + Send + Sync + std::fmt::Debug + 'static {}
+impl<K> QueueKey for K where K: Eq + Sized + Copy + Send + Sync + std::fmt::Debug + 'static {}
+
+pub struct Queue<K: QueueKey> {
+    id: K,
     share: u64,
     scheduler: Box<dyn Scheduler>,
 }
-impl Queue {
-    pub fn new<ID>(id: ID, share: u64, scheduler: Box<dyn Scheduler>) -> Self
-    where
-        ID: Into<u8>,
-    {
-        let id = id.into();
+impl<K: QueueKey> Queue<K> {
+    pub fn new(id: K, share: u64, scheduler: Box<dyn Scheduler>) -> Self {
         Self {
             id,
             share,
             scheduler,
         }
     }
-    pub fn id(&self) -> u8 {
+    pub fn id(&self) -> K {
         self.id
     }
     pub fn share(&self) -> u64 {
