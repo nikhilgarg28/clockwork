@@ -12,6 +12,6 @@
 <!-- 11) Add yield_maybe -->
 12) Add test to verify bad executor can't be created (0 shares, duplicate ID)
 13) Add test to verify that panic on task causes the whole thread to panic
-14) Make key system generic over Eq + Sized
-15) Add arrival_time and root_arrival_time per task, send to enqueue. Or should
-    we add parent_taskid?
+<!-- 14) Make key system generic over Eq + Sized -->
+<!-- 15) Add arrival_time and root_arrival_time per task, send to enqueue. Or should
+    we add parent_taskid? -->

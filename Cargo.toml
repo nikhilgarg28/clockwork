@@ -8,6 +8,7 @@ flume = "0.11"
 futures = "0.3"
 slab = "0.4"
 static_assertions = "1.1"
+ahash = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["time", "rt", "macros"] }

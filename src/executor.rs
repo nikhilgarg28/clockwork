@@ -13,6 +13,8 @@ use std::{
     cell::Cell,
     cell::RefCell,
     future::Future,
+    hash::{Hash, Hasher},
+    num::NonZeroU64,
     pin::Pin,
     rc::Rc,
     sync::atomic::Ordering,
@@ -26,6 +28,12 @@ thread_local! {
 
 fn set_yield_maybe_deadline(deadline: Instant) {
     YIELD_MAYBE_DEADLINE.with(|cell| cell.set(Some(deadline)));
+}
+
+fn hash<H: std::hash::Hash>(h: H) -> u64 {
+    let mut hasher = ahash::AHasher::default();
+    h.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug)]
@@ -182,6 +190,41 @@ impl ShutdownHandle {
         Self { inner }
     }
 }
+
+pub struct QueueHandle<K: QueueKey> {
+    executor: Rc<Executor<K>>,
+    qid: K,
+    hash: Option<NonZeroU64>,
+}
+impl<K: QueueKey> QueueHandle<K> {
+    pub fn group<H: Hash + std::fmt::Debug>(self: &Self, data: H) -> Self {
+        let hash = hash(data);
+        // set highest bit of hash to 1
+        let hash = hash | 1 << 63;
+        Self {
+            executor: self.executor.clone(),
+            qid: self.qid,
+            hash: Some(NonZeroU64::new(hash).unwrap()),
+        }
+    }
+    pub fn spawn<T, F>(self: &Self, fut: F) -> Result<JoinHandle<T, K>, SpawnError<K>>
+    where
+        T: 'static,
+        F: Future<Output = T> + 'static, // !Send ok
+    {
+        let group = match self.hash {
+            None => {
+                let h = self.executor.next_group_id.get();
+                self.executor.next_group_id.set(h + 1);
+                // set highest bit of h to 0 to distinguish from user provided groups
+                h & !(1 << 63)
+            }
+            Some(hash) => hash.get() as u64,
+        };
+        self.executor.spawn_inner(self.qid, group, fut)
+    }
+}
+
 /// The priority executor: single-thread polling + class vruntime selection.
 pub struct Executor<K: QueueKey> {
     ingress_tx: Sender<TaskId>,
@@ -202,6 +245,8 @@ pub struct Executor<K: QueueKey> {
     min_vruntime: std::cell::Cell<u128>,
     // stats
     stats: RefCell<ExecutorStats>,
+
+    next_group_id: std::cell::Cell<u64>,
 }
 assert_not_impl_any!(Executor<u8>: Send, Sync);
 
@@ -243,6 +288,7 @@ impl<K: QueueKey> Executor<K> {
             driver_yield: Duration::from_micros(500),
             min_vruntime: std::cell::Cell::new(0),
             stats: RefCell::new(ExecutorStats::new(Instant::now())),
+            next_group_id: std::cell::Cell::new(0),
         }))
     }
 
@@ -273,9 +319,25 @@ impl<K: QueueKey> Executor<K> {
         }
     }
 
-    /// Spawn onto a class (queue). Returns a JoinHandle that detaches on drop.
-    /// Spawn can only be called from the executor thread.
-    pub fn spawn<T, F>(self: &Rc<Self>, qid: K, fut: F) -> Result<JoinHandle<T, K>, SpawnError<K>>
+    /// Get a handle to a queue through which tasks can be spawned
+    pub fn queue(self: &Rc<Self>, qid: K) -> Result<QueueHandle<K>, SpawnError<K>> {
+        let Some(_) = self.qids.borrow().iter().position(|q| *q == qid) else {
+            return Err(SpawnError::QueueNotFound(qid));
+        };
+        Ok(QueueHandle {
+            executor: self.clone(),
+            qid,
+            hash: None,
+        })
+    }
+
+    /// Internal method to spawn a task onto a queue.
+    fn spawn_inner<T, F>(
+        self: &Rc<Self>,
+        qid: K,
+        group: u64,
+        fut: F,
+    ) -> Result<JoinHandle<T, K>, SpawnError<K>>
     where
         T: 'static,
         F: Future<Output = T> + 'static, // !Send ok
@@ -284,13 +346,11 @@ impl<K: QueueKey> Executor<K> {
 
         let mut tasks = self.tasks.borrow_mut();
         let qid = qid.into();
-        let Some(_) = self.qids.borrow().iter().position(|q| *q == qid) else {
-            return Err(SpawnError::QueueNotFound(qid));
-        };
+        assert!(self.qids.borrow().iter().position(|q| *q == qid).is_some());
         self.ensure_accepting()?;
         let entry = tasks.vacant_entry();
         let id = entry.key();
-        let header = Arc::new(TaskHeader::new(id, qid, self.ingress_tx.clone()));
+        let header = Arc::new(TaskHeader::new(id, qid, group, self.ingress_tx.clone()));
 
         // Wrap user future to publish result into JoinState.
         let wrapped = CancelableFuture::new(header.clone(), join.clone(), fut);
@@ -330,7 +390,7 @@ impl<K: QueueKey> Executor<K> {
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[idx];
         let was_runnable = queue.scheduler.is_runnable();
-        queue.scheduler.push(id);
+        queue.scheduler.push(id, task.header.group());
         let now_runnable = queue.scheduler.is_runnable();
         let became_runnable = !was_runnable && now_runnable;
         // this queue just became runnable, so update its vruntime
@@ -535,13 +595,13 @@ impl<K: QueueKey> Executor<K> {
                         let mut queues = self.queues.borrow_mut();
                         let queue = &mut queues[qidx];
                         queue.scheduler.clear_state(id);
-                        queue.scheduler.record(id, start, end, true);
+                        queue.scheduler.observe(id, start, end, true);
                     }
                     // Task is still running, nothing to do.
                     Poll::Pending => {
                         let mut queues = self.queues.borrow_mut();
                         let queue = &mut queues[qidx];
-                        queue.scheduler.record(id, start, end, false);
+                        queue.scheduler.observe(id, start, end, false);
                     }
                 };
                 if end > class_end {
@@ -625,9 +685,12 @@ mod tests {
                 let counter = Arc::new(AtomicU32::new(0));
 
                 let counter_clone = counter.clone();
-                let handle = executor.spawn(0, async move {
-                    counter_clone.fetch_add(1, Ordering::Relaxed);
-                });
+                let queue = executor.queue(0).unwrap();
+                let handle = queue
+                    .spawn(async move {
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .unwrap();
 
                 // Run executor in background
                 let executor_clone = executor.clone();
@@ -636,7 +699,7 @@ mod tests {
                 });
 
                 // Wait for task to complete
-                let result = timeout(Duration::from_millis(100), handle.unwrap()).await;
+                let result = timeout(Duration::from_millis(100), handle).await;
                 assert!(result.is_ok(), "Task should complete");
                 assert_eq!(counter.load(Ordering::Relaxed), 1);
             })
@@ -651,7 +714,8 @@ mod tests {
                 let executor =
                     Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
 
-                let handle = executor.spawn(0, async move { 42 });
+                let queue = executor.queue(0).unwrap();
+                let handle = queue.spawn(async move { 42 });
 
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
@@ -678,8 +742,9 @@ mod tests {
 
                 let started_clone = started.clone();
                 let completed_clone = completed.clone();
-                let handle = executor
-                    .spawn(0, async move {
+                let queue = executor.queue(0).unwrap();
+                let handle = queue
+                    .spawn(async move {
                         started_clone.store(true, Ordering::Relaxed);
                         // Task that runs for a while
                         for _ in 0..100 {
@@ -745,7 +810,8 @@ mod tests {
                 // pending (not runnable), so they can't compete for CPU, thus
                 // giving low weight class access to the CPU when high weight
                 // class is not runnable.
-                let handle1 = executor.spawn(0, async move {
+                let queue1 = executor.queue(0).unwrap();
+                let handle1 = queue1.spawn(async move {
                     loop {
                         for _ in 0..100_000 {
                             high_clone.fetch_add(1, Ordering::Relaxed);
@@ -753,7 +819,8 @@ mod tests {
                         yield_once().await;
                     }
                 });
-                let handle2 = executor.spawn(1, async move {
+                let queue2 = executor.queue(1).unwrap();
+                let handle2 = queue2.spawn(async move {
                     loop {
                         for _ in 0..100_000 {
                             low_clone.fetch_add(1, Ordering::Relaxed);
@@ -784,12 +851,13 @@ mod tests {
             .run_until(async {
                 let executor =
                     Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                let queue = executor.queue(0).unwrap();
                 let execution_order = Arc::new(Mutex::new(Vec::new()));
 
                 // Spawn multiple tasks that should execute in FIFO order
                 for i in 0..5 {
                     let order_clone = execution_order.clone();
-                    let _handle = executor.spawn(0, async move {
+                    let _handle = queue.spawn(async move {
                         order_clone.lock().unwrap().push(i);
                     });
                 }
@@ -821,13 +889,14 @@ mod tests {
             .run_until(async {
                 let executor =
                     Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                let queue = executor.queue(0).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
                 // Spawn multiple tasks that all increment the counter
                 let mut handles = Vec::new();
                 for _ in 0..5 {
                     let counter_clone = counter.clone();
-                    let handle = executor.spawn(0, async move {
+                    let handle = queue.spawn(async move {
                         counter_clone.fetch_add(1, Ordering::Relaxed);
                     });
                     handles.push(handle);
@@ -856,10 +925,11 @@ mod tests {
             .run_until(async {
                 let executor =
                     Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                let queue = executor.queue(0).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
                 let counter_clone = counter.clone();
-                let handle = executor.spawn(0, async move {
+                let handle = queue.spawn(async move {
                     for _ in 0..3 {
                         counter_clone.fetch_add(1, Ordering::Relaxed);
                         sleep(Duration::from_millis(10)).await;
@@ -890,12 +960,14 @@ mod tests {
         // Create a custom policy that tracks which tasks are picked
         struct Tracker {
             ids: Vec<TaskId>,
+            enqueued: Arc<Mutex<Vec<(u64, TaskId)>>>,
             picked: Arc<Mutex<Vec<(TaskId, bool)>>>,
         }
 
         impl Scheduler for Tracker {
-            fn push(&mut self, id: TaskId) {
+            fn push(&mut self, id: TaskId, group: u64) {
                 self.ids.push(id);
+                self.enqueued.lock().unwrap().push((group, id));
             }
             fn clear_state(&mut self, _id: TaskId) {}
 
@@ -912,7 +984,7 @@ mod tests {
                 !self.ids.is_empty()
             }
 
-            fn record(&mut self, id: TaskId, _start: Instant, _end: Instant, ready: bool) {
+            fn observe(&mut self, id: TaskId, _start: Instant, _end: Instant, ready: bool) {
                 self.picked.lock().unwrap().push((id, ready));
             }
         }
@@ -921,6 +993,7 @@ mod tests {
         // but we can verify that the default FifoPolicy is being used
         // by checking execution order
         let local = LocalSet::new();
+        let enqueued = Arc::new(Mutex::new(Vec::new()));
         let picked = Arc::new(Mutex::new(Vec::new()));
         local
             .run_until(async {
@@ -930,12 +1003,14 @@ mod tests {
                     Box::new(Tracker {
                         ids: Vec::new(),
                         picked: picked.clone(),
+                        enqueued: enqueued.clone(),
                     }),
                 )])
                 .unwrap();
+                let queue = executor.queue(0).unwrap();
                 // Spawn tasks with different IDs
-                for _ in 0..3 {
-                    let _handle = executor.spawn(0, async {});
+                for i in 0..3 {
+                    let _handle = queue.group(i % 2).spawn(async {});
                 }
 
                 local.spawn_local(async move {
@@ -949,6 +1024,12 @@ mod tests {
                 // verify tasks are in reverse order of their IDs and are all ready
                 assert!(picked[0].0 > picked[1].0 && picked[1].0 > picked[2].0);
                 assert!(picked.iter().all(|(_, ready)| *ready));
+                // also verify first and third tasks are in the same group but
+                // second task is in a different group
+                let enqueued = enqueued.lock().unwrap();
+                assert_eq!(enqueued.len(), 3);
+                assert_eq!(enqueued[0].0, enqueued[2].0);
+                assert_ne!(enqueued[0].0, enqueued[1].0);
             })
             .await;
     }
@@ -960,11 +1041,12 @@ mod tests {
             .run_until(async {
                 let executor =
                     Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                let queue = executor.queue(0).unwrap();
                 let executed = Arc::new(AtomicBool::new(false));
 
                 let executed_clone = executed.clone();
-                let handle = executor
-                    .spawn(0, async move {
+                let handle = queue
+                    .spawn(async move {
                         executed_clone.store(true, Ordering::Relaxed);
                     })
                     .unwrap();
@@ -1019,11 +1101,13 @@ mod tests {
                 local.spawn_local(async move {
                     executor_clone.run().await;
                 });
-                let _ = executor.spawn(QueueId::High, async move {
+                let q1 = executor.queue(QueueId::High).unwrap();
+                let _ = q1.spawn(async move {
                     high_clone.fetch_add(1, Ordering::Relaxed);
                     yield_once().await;
                 });
-                let _ = executor.spawn(QueueId::Low, async move {
+                let q2 = executor.queue(QueueId::Low).unwrap();
+                let _ = q2.spawn(async move {
                     low_clone.fetch_add(1, Ordering::Relaxed);
                     yield_once().await;
                 });
@@ -1044,7 +1128,8 @@ mod tests {
                 .unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
-                let _ = executor.spawn(0, async move {
+                let q1 = executor.queue(0).unwrap();
+                let _ = q1.spawn(async move {
                     for _ in 0..1000 {
                         counter_clone.fetch_add(1, Ordering::Relaxed);
                         yield_once().await;
@@ -1060,7 +1145,8 @@ mod tests {
                 assert!(vruntime1 > 0);
                 // now spawn a task in the second queue
                 let counter_clone = counter.clone();
-                let _ = executor.spawn(1, async move {
+                let q2 = executor.queue(1).unwrap();
+                let _ = q2.spawn(async move {
                     counter_clone.fetch_add(1, Ordering::Relaxed);
                 });
                 sleep(Duration::from_millis(100)).await;
@@ -1084,16 +1170,17 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let queue = Queue::new(0, 1, Box::new(FifoQueue::new()));
-                let executor = Executor::new(vec![queue]).unwrap();
+                let executor =
+                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                let queue = executor.queue(0).unwrap();
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
                     executor_clone.run().await;
                 });
                 let counter1 = Arc::new(AtomicU32::new(0));
                 let counter1_clone = counter1.clone();
-                let handle = executor
-                    .spawn(0, async move {
+                let handle = queue
+                    .spawn(async move {
                         let mut i = 0;
                         loop {
                             counter1_clone.fetch_add(1, Ordering::Relaxed);
@@ -1128,7 +1215,8 @@ mod tests {
             executor_clone.run().await;
         });
         let h2 = smol_local_ex.spawn(async move {
-            let handle = executor.spawn(0, async move { 42 }).unwrap();
+            let queue = executor.queue(0).unwrap();
+            let handle = queue.spawn(async move { 42 }).unwrap();
             handle.await
         });
 
@@ -1145,16 +1233,17 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let queue = Queue::new(0, 1, Box::new(FifoQueue::new()));
-                let executor = Executor::new(vec![queue]).unwrap();
+                let executor =
+                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
                     executor_clone.run().await;
                 });
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
-                let handle = executor
-                    .spawn(0, async move {
+                let queue = executor.queue(0).unwrap();
+                let handle = queue
+                    .spawn(async move {
                         counter_clone.fetch_add(1, Ordering::Relaxed);
                         42
                     })
@@ -1183,8 +1272,9 @@ mod tests {
             let counter = Arc::new(AtomicU32::new(0));
 
             let counter_clone = counter.clone();
-            let handle = executor
-                .spawn(0, async move {
+            let queue = executor.queue(0).unwrap();
+            let handle = queue
+                .spawn(async move {
                     counter_clone.fetch_add(1, Ordering::Relaxed);
                     42
                 })
@@ -1222,8 +1312,9 @@ mod tests {
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
                 // spawn a task that runs forever
-                let task = executor
-                    .spawn(0, async move {
+                let queue = executor.queue(0).unwrap();
+                let task = queue
+                    .spawn(async move {
                         loop {
                             counter_clone.fetch_add(1, Ordering::Relaxed);
                             sleep(Duration::from_millis(100)).await;
@@ -1237,7 +1328,8 @@ mod tests {
                 // shutdown with drain mode
                 let shutdown_handle = executor.shutdown(ShutdownMode::Force);
                 // can't spawn after shutdown
-                let result = executor.spawn(0, async move { 42 });
+                let queue = executor.queue(0).unwrap();
+                let result = queue.spawn(async move { 42 });
                 assert!(matches!(result.unwrap_err(), SpawnError::ShuttingDown));
                 // await shutdown handle
                 shutdown_handle.await;
@@ -1264,8 +1356,9 @@ mod tests {
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
                 // spawn a task that runs forever
-                let task = executor
-                    .spawn(0, async move {
+                let queue = executor.queue(0).unwrap();
+                let task = queue
+                    .spawn(async move {
                         loop {
                             counter_clone.fetch_add(1, Ordering::Relaxed);
                             sleep(Duration::from_millis(100)).await;
@@ -1281,7 +1374,8 @@ mod tests {
                 let shutdown_handle =
                     executor.shutdown(ShutdownMode::DrainFor(Duration::from_secs(1)));
                 // can't spawn after shutdown
-                let result = executor.spawn(0, async move { 42 });
+                let queue = executor.queue(0).unwrap();
+                let result = queue.spawn(async move { 42 });
                 assert!(matches!(result.unwrap_err(), SpawnError::ShuttingDown));
                 // sleep for 100 ms - task should still be running
                 sleep(Duration::from_millis(100)).await;
@@ -1319,8 +1413,9 @@ mod tests {
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
                 // spawn a task that runs forever
-                let task = executor
-                    .spawn(0, async move {
+                let queue = executor.queue(0).unwrap();
+                let task = queue
+                    .spawn(async move {
                         counter_clone.fetch_add(1, Ordering::Relaxed);
                         sleep(Duration::from_millis(100)).await;
                         counter_clone.fetch_add(1, Ordering::Relaxed);
