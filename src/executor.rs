@@ -477,169 +477,208 @@ impl<K: QueueKey> Executor<K> {
     /// Panic behavior: if any task panics while being polled, the executor panics (propagates).
     pub async fn run(&self) -> () {
         let mut last_driver_yield_at = Instant::now();
+
         loop {
             let now = Instant::now();
-            println!("run loop iteration");
+
+            // Handle shutdown if needed
             if self.should_force_now(now) && !self.shutdown.force_initiated.get() {
-                println!("inside should_force_now");
-                // Cancel remaining tasks
-                println!("cancelling all tasks");
+                self.shutdown.force_initiated.set(true);
                 self.force_cancel_all_tasks();
-                println!("cancelled all tasks");
             }
 
             self.stats.borrow_mut().record_loop_iter();
-            // Always ingest wakeups first.
             self.drain_ingress_into_classes(now);
 
-            // If nothing runnable, park by awaiting one ingress item.
-            let next = {
-                let t1 = Instant::now();
-                let next = self.pick_next_class();
-                let elapsed = Instant::now().duration_since(t1);
-                self.stats.borrow_mut().record_schedule_decision(elapsed);
-                next
+            // Select next queue to run
+            let Some((qidx, timeslice)) = self.select_queue() else {
+                // Nothing runnable - wait for tasks
+                let more = self.wait_for_tasks(now).await;
+                if !more {
+                    break;
+                } else {
+                    continue;
+                }
             };
-            if next.is_none() {
-                let idle_start = Instant::now();
-                // park self until new item is enqueued
-                let recv = self.ingress_rx.recv_async().await;
-                let idle_end = Instant::now();
-                let idle_duration = idle_end.duration_since(idle_start);
-                self.stats.borrow_mut().idle_ns += idle_duration.as_nanos();
-                match recv {
-                    Ok(id) => {
-                        self.enqueue_task(id, now);
-                        continue;
-                    }
-                    Err(_) => {
-                        // sender side dropped + no pending items => we're done
-                        break;
-                    }
-                }
-            }
-            // Choose class, then choose task within class.
-            let (qidx, timeslice) = self.pick_next_class().expect("checked runnable");
+
+            // Execute timeslice
             let timeslice = timeslice.min(self.driver_yield);
-            let now = Instant::now();
-            let class_end = now + timeslice;
-            self.queues.borrow_mut()[qidx]
-                .stats
-                .record_first_service_after_runnable(now);
-            'timeslice: loop {
-                set_yield_maybe_deadline(class_end);
-                let mut maybe_task = {
-                    let mut queues = self.queues.borrow_mut();
-                    let queue = &mut queues[qidx];
-                    queue.stats.record_runnable_dequeue();
-                    queue.scheduler.pop()
-                };
+            self.run_timeslice(qidx, timeslice);
 
-                // Skip dead/stale tasks if policy had tombstones or late notifications.
-                let id = loop {
-                    let Some(id) = maybe_task else {
-                        // Class became empty; re-loop.
-                        break None;
-                    };
-                    let tasks = self.tasks.borrow();
-                    let Some(task) = tasks.get(id) else {
-                        // Stale id; pick again from same class.
-                        drop(tasks);
-                        let mut queues = self.queues.borrow_mut();
-                        let queue = &mut queues[qidx];
-                        queue.stats.record_runnable_dequeue();
-                        maybe_task = queue.scheduler.pop();
-                        continue;
-                    };
-                    if task.header.is_done() {
-                        // this is spurious task - we have already done cleanup
-                        // before so nothing to do here
-                        drop(tasks);
-                        let mut queues = self.queues.borrow_mut();
-                        let queue = &mut queues[qidx];
-                        maybe_task = queue.scheduler.pop();
-                        continue;
-                    }
-                    break Some(id);
-                };
-
-                let Some(id) = id else {
-                    break 'timeslice;
-                };
-
-                // Poll the task once.
-                let start = Instant::now();
-                let mut tasks = self.tasks.borrow_mut();
-                let Some(task) = tasks.get_mut(id) else {
-                    continue 'timeslice;
-                };
-
-                // Clear queued before polling so a wake during poll can enqueue again.
-                task.header.set_queued(false);
-
-                let w = waker(task.header.clone());
-                let mut cx = Context::from_waker(&w);
-
-                // NOTE: default abort-on-panic is achieved by *not* catching unwind here.
-                let poll = task.fut.as_mut().poll(&mut cx);
-
-                let end = Instant::now();
-                let elapsed = end.saturating_duration_since(start);
-                self.charge_class(qidx, elapsed);
-
-                match poll {
-                    Poll::Ready(()) => {
-                        task.header.set_done();
-                        tasks.remove(id);
-                        self.live_tasks.fetch_sub(1, Ordering::Relaxed);
-                        let mut queues = self.queues.borrow_mut();
-                        let queue = &mut queues[qidx];
-                        queue.scheduler.clear_state(id);
-                        queue.scheduler.observe(id, start, end, true);
-                    }
-                    // Task is still running, nothing to do.
-                    Poll::Pending => {
-                        let mut queues = self.queues.borrow_mut();
-                        let queue = &mut queues[qidx];
-                        queue.scheduler.observe(id, start, end, false);
-                    }
-                };
-                if end > class_end {
-                    self.stats.borrow_mut().record_poll(elapsed, true);
-                    let mut queues = self.queues.borrow_mut();
-                    queues[qidx].stats.record_slice_overrun();
-                    queues[qidx].stats.record_slice_exhausted();
-                    break 'timeslice;
-                }
-            }
-            // compute new min vruntime - note that qid may not be runnable
-            // anymore but we do want to include it in the computation
+            // Update executor's min_vruntime
             let new_vruntime = self.queues.borrow()[qidx].vruntime;
             self.update_min_vruntime(new_vruntime);
 
-            if self.shutdown.requested() {
-                if self.num_live_tasks() == 0 {
-                    self.shutdown.mark_stopped_and_wake_waiters();
-                    break;
-                }
+            // Check shutdown
+            if self.shutdown.requested() && self.num_live_tasks() == 0 {
+                self.shutdown.mark_stopped_and_wake_waiters();
+                break;
             }
 
-            // Give the underlying runtime a chance to run its drivers.
-            let now = Instant::now();
-            let since_last = now - last_driver_yield_at;
-            yield_once().await;
-            last_driver_yield_at = Instant::now();
-            let in_driver = last_driver_yield_at.duration_since(now);
-
-            self.stats
-                .borrow_mut()
-                .record_driver_yield(since_last, in_driver);
+            // Yield to driver
+            last_driver_yield_at = self.yield_to_driver(last_driver_yield_at).await;
         }
     }
 
     fn num_live_tasks(&self) -> usize {
         self.live_tasks.load(Ordering::Relaxed)
     }
+
+    /// Wait for new tasks if nothing is runnable.
+    /// Returns true if we should continue the loop, false if we should break.
+    async fn wait_for_tasks(&self, now: Instant) -> bool {
+        let idle_start = Instant::now();
+        let recv = self.ingress_rx.recv_async().await;
+        let idle_end = Instant::now();
+        let idle_duration = idle_end.duration_since(idle_start);
+        self.stats.borrow_mut().idle_ns += idle_duration.as_nanos();
+
+        match recv {
+            Ok(id) => {
+                self.enqueue_task(id, now);
+                true // Continue loop
+            }
+            Err(_) => {
+                // Sender dropped + no pending items => we're done
+                false // Break loop
+            }
+        }
+    }
+
+    /// Select the next queue to run and measure the decision time.
+    fn select_queue(&self) -> Option<(usize, Duration)> {
+        let t1 = Instant::now();
+        let result = self.pick_next_class();
+        let elapsed = Instant::now().duration_since(t1);
+        self.stats.borrow_mut().record_schedule_decision(elapsed);
+        result
+    }
+
+    /// Pop the next valid task from a queue, skipping stale/done tasks.
+    fn pop_next_task_from_queue(&self, qidx: usize) -> Option<TaskId> {
+        loop {
+            let mut queues = self.queues.borrow_mut();
+            let queue = &mut queues[qidx];
+            queue.stats.record_runnable_dequeue();
+            let maybe_id = queue.scheduler.pop();
+            drop(queues);
+
+            let Some(id) = maybe_id else {
+                return None;
+            };
+
+            let tasks = self.tasks.borrow();
+            let Some(task) = tasks.get(id) else {
+                // Stale id; try again
+                continue;
+            };
+
+            if task.header.is_done() {
+                // Spurious task; try again
+                continue;
+            }
+
+            return Some(id);
+        }
+    }
+
+    /// Poll a single task and return whether it completed, the start time, and the elapsed time.
+    fn poll_task(&self, id: TaskId, qidx: usize) -> (bool, Instant, Duration) {
+        let start = Instant::now();
+        let mut tasks = self.tasks.borrow_mut();
+        let Some(task) = tasks.get_mut(id) else {
+            return (false, start, Duration::ZERO);
+        };
+
+        // Clear queued before polling so a wake during poll can enqueue again.
+        task.header.set_queued(false);
+
+        let w = waker(task.header.clone());
+        let mut cx = Context::from_waker(&w);
+
+        // NOTE: default abort-on-panic is achieved by *not* catching unwind here.
+        let poll = task.fut.as_mut().poll(&mut cx);
+        drop(tasks);
+
+        let end = Instant::now();
+        let elapsed = end.saturating_duration_since(start);
+        self.charge_class(qidx, elapsed);
+
+        match poll {
+            Poll::Ready(()) => (true, start, elapsed),
+            Poll::Pending => (false, start, elapsed),
+        }
+    }
+
+    /// Complete a task that finished (Ready).
+    fn complete_task(&self, id: TaskId, qidx: usize, start: Instant, end: Instant) {
+        let mut tasks = self.tasks.borrow_mut();
+        let task = tasks.get_mut(id).expect("task should exist");
+        task.header.set_done();
+        tasks.remove(id);
+
+        self.live_tasks.fetch_sub(1, Ordering::Relaxed);
+
+        let mut queues = self.queues.borrow_mut();
+        let queue = &mut queues[qidx];
+        queue.scheduler.clear_state(id);
+        queue.scheduler.observe(id, start, end, true);
+    }
+
+    /// Record that a task is still pending.
+    fn record_task_pending(&self, id: TaskId, qidx: usize, start: Instant, end: Instant) {
+        let mut queues = self.queues.borrow_mut();
+        let queue = &mut queues[qidx];
+        queue.scheduler.observe(id, start, end, false);
+    }
+
+    /// Execute tasks from a selected queue until the timeslice is exhausted.
+    fn run_timeslice(&self, qidx: usize, timeslice: Duration) {
+        let now = Instant::now();
+        let until = now + timeslice;
+        self.queues.borrow_mut()[qidx]
+            .stats
+            .record_first_service_after_runnable(now);
+
+        loop {
+            set_yield_maybe_deadline(until);
+
+            let Some(id) = self.pop_next_task_from_queue(qidx) else {
+                break; // Queue became empty
+            };
+
+            let (completed, start, elapsed) = self.poll_task(id, qidx);
+            let end = start + elapsed;
+
+            if completed {
+                self.complete_task(id, qidx, start, end);
+            } else {
+                self.record_task_pending(id, qidx, start, end);
+            }
+
+            if end > until {
+                self.stats.borrow_mut().record_poll(elapsed, true);
+                let mut queues = self.queues.borrow_mut();
+                queues[qidx].stats.record_slice_overrun();
+                queues[qidx].stats.record_slice_exhausted();
+                break;
+            }
+        }
+    }
+
+    /// Yield to the driver and record stats.
+    async fn yield_to_driver(&self, last_yield: Instant) -> Instant {
+        let now = Instant::now();
+        let since_last = now - last_yield;
+        yield_once().await;
+        let after_yield = Instant::now();
+        let in_driver = after_yield.duration_since(now);
+        self.stats
+            .borrow_mut()
+            .record_driver_yield(since_last, in_driver);
+        after_yield
+    }
+
     pub fn shutdown(&self, mode: ShutdownMode) -> ShutdownHandle {
         self.shutdown.accepting.set(false);
         self.shutdown.request_shutdown(mode);
