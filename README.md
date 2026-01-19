@@ -100,16 +100,24 @@ use tokio::task::LocalSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+enum Queue {
+    Foreground,
+    Background,
+}
+
 #[tokio::main]
 async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
         // Create executor with two queues:
-        // - Queue 0: weight 8 (gets 8/9 of CPU time)
-        // - Queue 1: weight 1 (gets 1/9 of CPU time)
+        // - Foreground: weight 8 (gets 8/9 of CPU time)
+        // - Background: weight 1 (gets 1/9 of CPU time)
+        // Note: Queue IDs can be enums (as shown here) or integers, strings, or any
+        // type implementing QueueKey
         let executor = ExecutorBuilder::new()
-            .with_queue(0, 8, LAS::new())  // High priority queue
-            .with_queue(1, 1, LAS::new())  // Low priority queue
+            .with_queue(Queue::Foreground, 8, LAS::new())  // High priority queue
+            .with_queue(Queue::Background, 1, LAS::new())  // Low priority queue
             .build()
             .unwrap();
 
@@ -122,8 +130,8 @@ async fn main() {
         let low_count = Arc::new(AtomicU32::new(0));
 
         // Spawn tasks in both queues
-        let high_queue = executor.queue(0).unwrap();
-        let low_queue = executor.queue(1).unwrap();
+        let high_queue = executor.queue(Queue::Foreground).unwrap();
+        let low_queue = executor.queue(Queue::Background).unwrap();
 
         high_queue.spawn({
             let count = high_count.clone();
