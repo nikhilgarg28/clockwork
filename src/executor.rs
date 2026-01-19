@@ -11,6 +11,7 @@ use futures::task::waker;
 use slab::Slab;
 use static_assertions::assert_not_impl_any;
 use std::{
+    any::Any,
     cell::Cell,
     cell::RefCell,
     future::Future,
@@ -52,14 +53,43 @@ struct CancelableFuture<T, K: QueueKey, F: Future<Output = T> + 'static> {
     header: Arc<TaskHeader<K>>, // has `cancelled: AtomicBool`
     join: Arc<JoinState<T>>,
     fut: Pin<Box<F>>,
+    catch_panics: bool,
 }
 
 impl<T, K: QueueKey, F: Future<Output = T> + 'static> CancelableFuture<T, K, F> {
-    pub fn new(header: Arc<TaskHeader<K>>, join: Arc<JoinState<T>>, fut: F) -> Self {
+    pub fn new(
+        header: Arc<TaskHeader<K>>,
+        join: Arc<JoinState<T>>,
+        fut: F,
+        catch_panics: bool,
+    ) -> Self {
         Self {
             header,
             join,
             fut: Box::pin(fut),
+            catch_panics,
+        }
+    }
+
+    fn convert_panic_to_error(
+        panic_payload: Box<dyn Any + Send>,
+    ) -> Box<dyn std::error::Error + Send> {
+        // Try to extract a meaningful error message from the panic
+        match panic_payload.downcast::<String>() {
+            Ok(msg) => Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Task panicked: {}", msg),
+            )) as Box<dyn std::error::Error + Send>,
+            Err(payload) => match payload.downcast::<&'static str>() {
+                Ok(msg) => Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Task panicked: {}", msg),
+                )) as Box<dyn std::error::Error + Send>,
+                Err(_) => Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Task panicked with unknown payload",
+                )) as Box<dyn std::error::Error + Send>,
+            },
         }
     }
 }
@@ -79,12 +109,26 @@ impl<T, K: QueueKey, F: Future<Output = T> + 'static> Future for CancelableFutur
             return Poll::Ready(());
         }
 
-        match self.fut.as_mut().poll(cx) {
-            Poll::Ready(out) => {
+        // Poll with optional panic handling
+        let poll_result = if self.catch_panics {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.fut.as_mut().poll(cx)))
+        } else {
+            Ok(self.fut.as_mut().poll(cx))
+        };
+
+        match poll_result {
+            Ok(Poll::Ready(out)) => {
                 self.join.try_complete_ok(out);
                 Poll::Ready(())
             }
-            Poll::Pending => Poll::Pending,
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(panic_payload) => {
+                // Convert panic to JoinError::Panic
+                let panic_err = Self::convert_panic_to_error(panic_payload);
+                self.join
+                    .try_complete_err(crate::join::JoinError::Panic(panic_err));
+                Poll::Ready(())
+            }
         }
     }
 }
@@ -92,7 +136,7 @@ impl<T, K: QueueKey, F: Future<Output = T> + 'static> Future for CancelableFutur
 /// Local (executor-thread-only) task record containing the !Send future.
 struct TaskRecord<K: QueueKey> {
     header: Arc<TaskHeader<K>>,
-    fut: Pin<Box<dyn Future<Output = ()> + 'static>>, // !Send ok
+    fut: Pin<Box<dyn Future<Output = ()> + 'static>>, // !Send ok - type-erased CancelableFuture
 }
 
 /// Global per-queue state maintained by the executor (vruntime/shares).
@@ -255,6 +299,10 @@ impl<K: QueueKey> ExecutorBuilder<K> {
         self.queues.push(queue);
         self
     }
+    pub fn with_panic_on_task_panic(mut self, panic_on_task_panic: bool) -> Self {
+        self.options.panic_on_task_panic = panic_on_task_panic;
+        self
+    }
     pub fn build(self) -> Result<Rc<Executor<K>>, String> {
         Executor::new(self.options, self.queues)
     }
@@ -264,6 +312,7 @@ pub struct ExecutorOptions {
     sched_latency: Duration,
     min_slice: Duration,
     driver_yield: Duration,
+    panic_on_task_panic: bool,
 }
 impl Default for ExecutorOptions {
     fn default() -> Self {
@@ -271,12 +320,14 @@ impl Default for ExecutorOptions {
             sched_latency: Duration::from_millis(2),
             min_slice: Duration::from_micros(100),
             driver_yield: Duration::from_micros(500),
+            panic_on_task_panic: true,
         }
     }
 }
 
 /// The priority executor: single-thread polling + class vruntime selection.
 pub struct Executor<K: QueueKey> {
+    options: ExecutorOptions,
     ingress_tx: Sender<TaskId>,
     ingress_rx: Receiver<TaskId>,
 
@@ -289,9 +340,6 @@ pub struct Executor<K: QueueKey> {
     queues: RefCell<Vec<QueueState<K>>>,
     qids: RefCell<Vec<K>>,
 
-    sched_latency: Duration,
-    min_slice: Duration,
-    driver_yield: Duration,
     min_vruntime: std::cell::Cell<u128>,
     // stats
     stats: RefCell<ExecutorStats>,
@@ -335,9 +383,7 @@ impl<K: QueueKey> Executor<K> {
             shutdown: Rc::new(ShutdownState::new()),
             qids: RefCell::new(qids),
             live_tasks: std::sync::atomic::AtomicUsize::new(0),
-            sched_latency: options.sched_latency,
-            min_slice: options.min_slice,
-            driver_yield: options.driver_yield,
+            options,
             min_vruntime: std::cell::Cell::new(0),
             stats: RefCell::new(ExecutorStats::new(Instant::now())),
             next_group_id: std::cell::Cell::new(0),
@@ -389,7 +435,9 @@ impl<K: QueueKey> Executor<K> {
         let header = Arc::new(TaskHeader::new(id, qid, group, self.ingress_tx.clone()));
         let join = Arc::new(JoinState::<T>::new());
         // Wrap user future to publish result into JoinState.
-        let wrapped = CancelableFuture::new(header.clone(), join.clone(), fut);
+        // catch_panics = !panic_on_task_panic (if executor panics on task panic, we don't catch)
+        let catch_panics = !self.options.panic_on_task_panic;
+        let wrapped = CancelableFuture::new(header.clone(), join.clone(), fut, catch_panics);
 
         // if not accepting, don't enqueue, must mark cancelled
         if !self.shutdown.accepting.get() {
@@ -458,8 +506,8 @@ impl<K: QueueKey> Executor<K> {
         if num_runnable == 0 {
             return None;
         }
-        let request = self.sched_latency.as_nanos() as u128 / num_runnable as u128;
-        let request = request.max(self.min_slice.as_nanos() as u128);
+        let request = self.options.sched_latency.as_nanos() as u128 / num_runnable as u128;
+        let request = request.max(self.options.min_slice.as_nanos() as u128);
         for (idx, q) in self.queues.borrow().iter().enumerate() {
             if !q.scheduler.is_runnable() {
                 continue;
@@ -545,7 +593,7 @@ impl<K: QueueKey> Executor<K> {
             };
 
             // Execute timeslice
-            let timeslice = timeslice.min(self.driver_yield);
+            let timeslice = timeslice.min(self.options.driver_yield);
             self.run_timeslice(qidx, timeslice);
 
             // Update executor's min_vruntime
@@ -632,14 +680,13 @@ impl<K: QueueKey> Executor<K> {
         let Some(task) = tasks.get_mut(id) else {
             return (false, start, Duration::ZERO);
         };
-
         // Clear queued before polling so a wake during poll can enqueue again.
         task.header.set_queued(false);
 
         let w = waker(task.header.clone());
         let mut cx = Context::from_waker(&w);
 
-        // NOTE: default abort-on-panic is achieved by *not* catching unwind here.
+        // CancelableFuture handles panics internally, so we can poll directly
         let poll = task.fut.as_mut().poll(&mut cx);
         drop(tasks);
 
@@ -1097,9 +1144,6 @@ mod tests {
             }
         }
 
-        // We can't easily inject a custom policy with the current API,
-        // but we can verify that the default FifoPolicy is being used
-        // by checking execution order
         let local = LocalSet::new();
         let enqueued = Arc::new(Mutex::new(Vec::new()));
         let picked = Arc::new(Mutex::new(Vec::new()));
@@ -1614,6 +1658,60 @@ mod tests {
                 let result = handle.await;
                 assert!(result.is_err());
                 assert!(result.unwrap_err().is_panic());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_panic_caught_when_configured() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                // Configure executor to catch panics instead of crashing
+                let opts = ExecutorOptions {
+                    sched_latency: Duration::from_millis(2),
+                    min_slice: Duration::from_micros(100),
+                    driver_yield: Duration::from_micros(500),
+                    panic_on_task_panic: false, // Don't panic on task panic
+                };
+                let executor = Executor::<u8>::new(
+                    opts,
+                    vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))],
+                )
+                .unwrap();
+                let queue = executor.queue(0).unwrap();
+
+                // Spawn executor in background
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+
+                // Spawn a task that panics
+                let task_handle = queue.spawn(async {
+                    panic!("test panic message");
+                });
+
+                // Wait for the task to complete (should complete with Panic error)
+                let result = timeout(Duration::from_millis(100), task_handle).await;
+                assert!(result.is_ok(), "Task should complete (with panic error)");
+
+                let join_result = result.unwrap();
+                assert!(join_result.is_err(), "Task should return an error");
+
+                match join_result.unwrap_err() {
+                    JoinError::Panic(_) => {
+                        // Expected - panic was caught and converted to JoinError::Panic
+                    }
+                    other => panic!("Expected JoinError::Panic, got {:?}", other),
+                }
+
+                // Executor should still be running (not crashed)
+                assert_eq!(
+                    executor.num_live_tasks(),
+                    0,
+                    "Task should be removed after panic"
+                );
             })
             .await;
     }

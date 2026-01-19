@@ -1,5 +1,6 @@
 use crate::{queue::QueueKey, task::TaskHeader};
 use futures::task::AtomicWaker;
+use std::error::Error;
 use std::{
     future::Future,
     pin::Pin,
@@ -7,10 +8,25 @@ use std::{
     task::{Context, Poll},
 };
 /// Error returned from awaiting a JoinHandle.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum JoinError {
     Cancelled,
     ResultTaken,
+    Panic(Box<dyn Error>),
+}
+
+impl PartialEq for JoinError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (JoinError::Cancelled, JoinError::Cancelled) => true,
+            (JoinError::ResultTaken, JoinError::ResultTaken) => true,
+            (JoinError::Panic(a), JoinError::Panic(b)) => {
+                // Compare error messages since we can't compare the Error trait objects directly
+                format!("{}", a) == format!("{}", b)
+            }
+            _ => false,
+        }
+    }
 }
 #[derive(Debug)]
 pub struct JoinState<T> {
@@ -58,6 +74,19 @@ impl<T> JoinState<T> {
             return false;
         }
         *self.result.lock().unwrap() = Some(Err(JoinError::Cancelled));
+        self.waker.wake();
+        true
+    }
+
+    pub fn try_complete_err(&self, err: JoinError) -> bool {
+        if self
+            .done
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        *self.result.lock().unwrap() = Some(Err(err));
         self.waker.wake();
         true
     }

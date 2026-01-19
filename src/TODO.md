@@ -17,4 +17,4 @@
     we add parent_taskid? -->
 <!-- 16) dont' make spawn return error - if not accepting, make tasks canceled -->
 17) Option to enable stats
-18) Configuration builder (e.g. sched_latency etc.)
+<!-- 18) Configuration builder (e.g. sched_latency etc.) -->
