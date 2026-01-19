@@ -2,6 +2,13 @@
 name = "clockwork"
 version = "0.1.0"
 edition = "2021"
+description = "A single-threaded async executor with EEVDF-based fair scheduling and pluggable task schedulers"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/nikhilgarg28/clockwork"
+authors = ["Nikhil Garg <nikhilgarg28@gmail.com>"]
+keywords = ["async", "executor", "scheduler", "runtime", "tokio"]
+categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 flume = "0.11"
