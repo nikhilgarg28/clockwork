@@ -18,6 +18,19 @@ static_assertions = "1.1"
 ahash = "0.8"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["time", "rt", "macros"] }
+tokio = { version = "1", features = ["full", "time", "rt", "macros"] }
 monoio = { version = "0.2" }
 smol = { version = "2.0" }
+rand = { version = "0.8", features = ["std"] }
+
+[[bench]]
+name = "overhead"
+harness = false
+
+[[bench]]
+name = "tail_latency"
+harness = false
+
+[[bench]]
+name = "scheduler_comparison"
+harness = false
