@@ -7,7 +7,6 @@ use crate::{
     yield_once::yield_once,
 };
 use flume::{Receiver, Sender};
-use futures::task::waker;
 use slab::Slab;
 use static_assertions::assert_not_impl_any;
 use std::{
@@ -136,6 +135,7 @@ impl<T, K: QueueKey, F: Future<Output = T> + 'static> Future for CancelableFutur
 /// Local (executor-thread-only) task record containing the !Send future.
 struct TaskRecord<K: QueueKey> {
     header: Arc<TaskHeader<K>>,
+    waker: std::task::Waker,
     fut: Pin<Box<dyn Future<Output = ()> + 'static>>, // !Send ok - type-erased CancelableFuture
 }
 
@@ -453,9 +453,11 @@ impl<K: QueueKey> Executor<K> {
             assert!(cancelled);
             return JoinHandle::new(header, join);
         }
+        let waker = futures::task::waker(header.clone());
 
         entry.insert(TaskRecord {
             header: header.clone(),
+            waker,
             fut: Box::pin(wrapped),
         });
         // increment live tasks
@@ -741,8 +743,7 @@ impl<K: QueueKey> Executor<K> {
         // Clear queued before polling so a wake during poll can enqueue again.
         task.header.set_queued(false);
 
-        let w = waker(task.header.clone());
-        let mut cx = Context::from_waker(&w);
+        let mut cx = Context::from_waker(&task.waker);
 
         // CancelableFuture handles panics internally, so we can poll directly
         let poll = task.fut.as_mut().poll(&mut cx);
