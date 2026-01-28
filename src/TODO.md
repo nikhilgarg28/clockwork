@@ -18,3 +18,5 @@
 <!-- 16) dont' make spawn return error - if not accepting, make tasks canceled -->
 17) Option to enable stats
 <!-- 18) Configuration builder (e.g. sched_latency etc.) -->
+Remove mpsc2, hide frspt, remove all prints
+Add method for with_queue and with_queue_having_scheduler

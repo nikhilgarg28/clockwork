@@ -8,9 +8,10 @@
 //! - 1C: IO reactor integration (timer-based tasks)
 
 use clockworker::{
-    scheduler::{RunnableFifo, LAS, QLAS},
+    scheduler::{LAS, QLAS},
     ExecutorBuilder,
 };
+use futures::future;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,7 +40,11 @@ const IO_TASK_COUNT: usize = 100;
 const SLEEPS_PER_TASK: usize = 10;
 const SLEEP_DURATION: Duration = Duration::from_micros(500);
 
-async fn drive<F>(executor: utils::Executor, n: usize, factory: impl Fn() -> F) -> Duration
+async fn drive<F>(
+    spawn: impl Fn(F) -> utils::Handle<()>,
+    n: usize,
+    factory: impl Fn() -> F,
+) -> Duration
 where
     F: std::future::Future<Output = ()> + 'static,
 {
@@ -47,9 +52,7 @@ where
     let mut handles = Vec::with_capacity(n);
     for _ in 0..n {
         let fut = factory();
-        handles.push(executor.spawn(async move {
-            fut.await;
-        }));
+        handles.push(spawn(fut));
     }
     for h in handles {
         let _ = h.await;
@@ -76,56 +79,58 @@ fn run_1a() -> Vec<utils::Metrics> {
         let mut cw_result = utils::Metrics::new();
 
         // Warmup
+        println!("Warming up Tokio: ");
         for _ in 0..WARMUP_ITERS {
             rt.block_on(async move {
                 let local = LocalSet::new();
-                let executor = utils::Executor::start_tokio(local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await;
-            })
+                let spawn = |fut| {
+                    let handle = local.spawn_local(fut);
+                    utils::Handle::Tokio(handle)
+                };
+                local.run_until(drive(spawn, n, factory)).await;
+            });
         }
         // Bench
         print!("Running Tokio: ");
         for _ in 0..BENCH_ITERS {
             let dur = rt.block_on(async move {
-                let executor = utils::Executor::start_tokio(LocalSet::new()).await;
-                let dur = executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await;
-                print!(".");
-                std::io::stdout().flush().unwrap();
-                dur
+                let local = LocalSet::new();
+                let spawn = |fut| {
+                    let handle = local.spawn_local(fut);
+                    utils::Handle::Tokio(handle)
+                };
+                local.run_until(drive(spawn, n, factory)).await
             });
             tokio_result.record(dur, &["spawn"]);
-        }
-        println!();
-        // now run clockworker
-        print!("Running Clockworker (FIFO): ");
-        let cw_executor = ExecutorBuilder::new()
-            .with_queue(0u8, 1, RunnableFifo::new())
-            .build()
-            .unwrap();
-        for _ in 0..WARMUP_ITERS {
-            let cw_executor = cw_executor.clone();
-            let dur = rt.block_on(async move {
-                let local = LocalSet::new();
-                let executor = utils::Executor::start_clockworker(cw_executor, local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await
-            });
-            cw_result.record(dur, &["spawn"]);
             print!(".");
             std::io::stdout().flush().unwrap();
         }
+        println!();
+        // now run clockworker
+        let executor = ExecutorBuilder::new().with_queue(0u8, 1).build().unwrap();
+        let spawn = |fut| {
+            let handle = executor.queue(0).unwrap().spawn(fut);
+            utils::Handle::Clockworker(handle)
+        };
+        println!("warming up clockworker");
+        std::io::stdout().flush().unwrap();
+        for _ in 0..WARMUP_ITERS {
+            let executor = executor.clone();
+            rt.block_on(async move {
+                let local = LocalSet::new();
+                local
+                    .run_until(executor.run_until(drive(spawn, n, factory)))
+                    .await;
+            })
+        }
+        print!("Running Clockworker (FIFO): ");
+        std::io::stdout().flush().unwrap();
         for _ in 0..BENCH_ITERS {
-            let cw_executor = cw_executor.clone();
+            let executor = executor.clone();
             let dur = rt.block_on(async move {
                 let local = LocalSet::new();
-                let executor = utils::Executor::start_clockworker(cw_executor.clone(), local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
+                local
+                    .run_until(executor.run_until(drive(spawn, n, factory)))
                     .await
             });
             cw_result.record(dur, &["spawn"]);
@@ -189,29 +194,31 @@ fn run_1b() -> Vec<utils::Metrics> {
         };
 
         // Clockworker with FIFO (lightweight scheduler)
-        print!("Running Clockworker (FIFO): ");
         let mut cw_fifo = utils::Metrics::new();
-        let executor = ExecutorBuilder::new()
-            .with_queue(0u8, 1, RunnableFifo::new())
-            .build()
-            .unwrap();
+        let executor = ExecutorBuilder::new().with_queue(0u8, 1).build().unwrap();
+        let spawn = |fut| {
+            let handle = executor.queue(0).unwrap().spawn(fut);
+            utils::Handle::Clockworker(handle)
+        };
+        println!("Warming up Clockworker (FIFO): ");
+        std::io::stdout().flush().unwrap();
         for _ in 0..WARMUP_ITERS {
             let executor = executor.clone();
             rt.block_on(async move {
                 let local = LocalSet::new();
-                let executor = utils::Executor::start_clockworker(executor, local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
+                local
+                    .run_until(executor.run_until(drive(spawn, n, factory)))
                     .await;
             })
         }
+        print!("Running Clockworker (FIFO): ");
+        std::io::stdout().flush().unwrap();
         for _ in 0..BENCH_ITERS {
             let executor = executor.clone();
             let dur = rt.block_on(async move {
                 let local = LocalSet::new();
-                let executor = utils::Executor::start_clockworker(executor, local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
+                local
+                    .run_until(executor.run_until(drive(spawn, n, factory)))
                     .await
             });
             cw_fifo.record(dur, &["yield"]);
@@ -220,87 +227,30 @@ fn run_1b() -> Vec<utils::Metrics> {
         }
         println!();
 
-        // Clockworker with LAS (heavier scheduler)
-        print!("Running Clockworker (LAS): ");
-        let mut cw_las = utils::Metrics::new();
-        let cw_executor = ExecutorBuilder::new()
-            .with_queue(0u8, 1, LAS::new())
-            .build()
-            .unwrap();
-        for _ in 0..WARMUP_ITERS {
-            let cw_executor = cw_executor.clone();
-            rt.block_on(async move {
-                let local = LocalSet::new();
-                let executor = utils::Executor::start_clockworker(cw_executor, local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await;
-            })
-        }
-        for _ in 0..BENCH_ITERS {
-            let cw_executor = cw_executor.clone();
-            let dur = rt.block_on(async move {
-                let local = LocalSet::new();
-                let executor = utils::Executor::start_clockworker(cw_executor, local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await
-            });
-            cw_las.record(dur, &["yield"]);
-            print!(".");
-            std::io::stdout().flush().unwrap();
-        }
-        println!();
-        // now run clockworker with QLAS
-        print!("Running Clockworker (QLAS): ");
-        let mut cw_qlas = utils::Metrics::new();
-        let cw_executor = ExecutorBuilder::new()
-            .with_queue(0u8, 1, QLAS::new())
-            .build()
-            .unwrap();
-        for _ in 0..WARMUP_ITERS {
-            let cw_executor = cw_executor.clone();
-            rt.block_on(async move {
-                let local = LocalSet::new();
-                let executor = utils::Executor::start_clockworker(cw_executor, local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await;
-            })
-        }
-        for _ in 0..BENCH_ITERS {
-            let cw_executor = cw_executor.clone();
-            let dur = rt.block_on(async move {
-                let local = LocalSet::new();
-                let executor = utils::Executor::start_clockworker(cw_executor, local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await
-            });
-            cw_qlas.record(dur, &["yield"]);
-            print!(".");
-            std::io::stdout().flush().unwrap();
-        }
-        println!();
-
         // Tokio baseline
         let mut tokio_result = utils::Metrics::new();
+        println!("Warming up Tokio: ");
+        std::io::stdout().flush().unwrap();
         for _ in 0..WARMUP_ITERS {
             rt.block_on(async move {
                 let local = LocalSet::new();
-                let executor = utils::Executor::start_tokio(local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await;
+                let spawn = |fut| {
+                    let handle = local.spawn_local(fut);
+                    utils::Handle::Tokio(handle)
+                };
+                local.run_until(drive(spawn, n, factory)).await;
             })
         }
+        print!("Running Tokio: ");
+        std::io::stdout().flush().unwrap();
         for _ in 0..BENCH_ITERS {
             let dur = rt.block_on(async move {
                 let local = LocalSet::new();
-                let executor = utils::Executor::start_tokio(local).await;
-                executor
-                    .run_until(drive(executor.clone(), n, factory))
-                    .await
+                let spawn = |fut| {
+                    let handle = local.spawn_local(fut);
+                    utils::Handle::Tokio(handle)
+                };
+                local.run_until(drive(spawn, n, factory)).await
             });
             tokio_result.record(dur, &["yield"]);
             print!(".");
@@ -311,17 +261,7 @@ fn run_1b() -> Vec<utils::Metrics> {
         // Print comparison
         let tokio_polls_per_sec = total_polls as f64 / tokio_result.mean("yield").as_secs_f64();
         let fifo_polls_per_sec = total_polls as f64 / cw_fifo.mean("yield").as_secs_f64();
-        let las_polls_per_sec = total_polls as f64 / cw_las.mean("yield").as_secs_f64();
-        let qlas_polls_per_sec = total_polls as f64 / cw_qlas.mean("yield").as_secs_f64();
         let fifo_overhead = (cw_fifo.mean("yield").as_nanos() as f64
-            / tokio_result.mean("yield").as_nanos() as f64
-            - 1.0)
-            * 100.0;
-        let las_overhead = (cw_las.mean("yield").as_nanos() as f64
-            / tokio_result.mean("yield").as_nanos() as f64
-            - 1.0)
-            * 100.0;
-        let qlas_overhead = (cw_qlas.mean("yield").as_nanos() as f64
             / tokio_result.mean("yield").as_nanos() as f64
             - 1.0)
             * 100.0;
@@ -332,27 +272,13 @@ fn run_1b() -> Vec<utils::Metrics> {
             tokio_result.mean("yield")
         );
         println!(
-            "    Clockworker/QLAS: {:.2e} polls/sec (mean: {:?}) [overhead: {:.1}%]",
-            qlas_polls_per_sec,
-            cw_qlas.mean("yield"),
-            qlas_overhead
-        );
-        println!(
             "    Clockworker/FIFO: {:.2e} polls/sec (mean: {:?}) [overhead: {:.1}%]",
             fifo_polls_per_sec,
             cw_fifo.mean("yield"),
             fifo_overhead
         );
-        println!(
-            "    Clockworker/LAS:  {:.2e} polls/sec (mean: {:?}) [overhead: {:.1}%]",
-            las_polls_per_sec,
-            cw_las.mean("yield"),
-            las_overhead
-        );
 
         results.push(cw_fifo);
-        results.push(cw_las);
-        results.push(cw_qlas);
         results.push(tokio_result);
     }
 
@@ -369,17 +295,9 @@ async fn bench_1c_clockworker(
     sleeps: usize,
     sleep_dur: Duration,
 ) -> (Duration, Vec<Duration>) {
-    let executor = ExecutorBuilder::new()
-        .with_queue(0u8, 1, RunnableFifo::new())
-        .build()
-        .unwrap();
+    let executor = ExecutorBuilder::new().with_queue(0u8, 1).build().unwrap();
 
     let queue = executor.queue(0).unwrap();
-
-    let executor_clone = executor.clone();
-    let runner = tokio::task::spawn_local(async move {
-        executor_clone.run().await;
-    });
 
     // Collect actual sleep durations to measure accuracy
     let sleep_accuracies: Arc<std::sync::Mutex<Vec<Duration>>> =
@@ -401,13 +319,15 @@ async fn bench_1c_clockworker(
         }));
     }
 
-    for h in handles {
-        let _ = h.await;
-    }
+    // Run executor until all handles complete
+    let executor_clone = executor.clone();
+    executor_clone
+        .run_until(async {
+            future::join_all(handles).await;
+        })
+        .await;
 
     let elapsed = start.elapsed();
-
-    runner.abort();
 
     let accuracies = Arc::try_unwrap(sleep_accuracies)
         .unwrap()

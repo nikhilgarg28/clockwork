@@ -1,0 +1,26 @@
+# Ignore build artifacts
+target/
+!target/release/
+
+# Ignore git
+.git/
+.gitignore
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore temporary files
+*.tmp
+*.log
+
+# Ignore documentation that's not needed for benchmarks
+*.md
+!README.md
+
+# Ignore nested target directories in monoio-benchmark
+monoio-benchmark/target/
+monoio-benchmark/*/target/

@@ -1,5 +1,6 @@
 use crate::{queue::TaskId, scheduler::Scheduler};
-use ahash::AHashMap as HashMap;
+use ahash::HashMapExt;
+use nohash_hasher::IntMap;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -15,49 +16,76 @@ pub struct QLAS {
     queues: [VecDeque<TaskId>; 32],
 
     // service time for each group
-    service: HashMap<u64, u128>,
+    service: IntMap<u64, u128>,
+
+    head: usize,
+    iter: u64,
 }
 
 impl QLAS {
     pub fn new() -> Self {
-        let mut queues = Vec::with_capacity(32);
-        for _ in 0..32 {
-            queues.push(VecDeque::new());
-        }
-        let queues = queues.try_into().unwrap();
+        let queues = std::array::from_fn(|_| VecDeque::with_capacity(256));
         Self {
             present: 0,
             queues,
-            service: HashMap::new(),
+            service: IntMap::with_capacity(1024),
+            head: 0,
+            iter: 0,
         }
+    }
+    fn fair_pop(&mut self) -> Option<TaskId> {
+        debug_assert!(self.present != 0);
+        let len = self.queues.len();
+        for _ in 0..len {
+            let head = self.head;
+            self.head = (head + 1) % len;
+            if let Some(id) = self.pop_queue(head) {
+                return Some(id);
+            }
+        }
+        // unreachable because we come here only when some queue is non-empty
+        unreachable!();
+    }
+
+    fn pop_queue(&mut self, idx: usize) -> Option<TaskId> {
+        if self.present & (1 << idx) == 0 {
+            return None;
+        }
+        let q = &mut self.queues[idx];
+        let id = q.pop_front();
+        if q.is_empty() {
+            self.present &= !(1 << idx);
+        }
+        id
     }
 }
 impl Scheduler for QLAS {
+    fn init(&mut self, _mpsc: std::sync::Arc<crate::mpsc::Mpsc<TaskId>>) {
+        // QLAS doesn't use mpsc directly - it builds its own structure in push()
+    }
+
     fn push(&mut self, id: TaskId, gid: u64, _at: Instant) {
-        let service = self.service.get(&gid).map_or(0, |s| *s);
+        // convert nanoseconds to microseconds
+        let service = self.service.get(&gid).map_or(0, |s| *s) / 1000;
         let queue_idx = if service <= 1 {
             0
         } else {
             service.ilog2().min(31) as usize
         };
         self.queues[queue_idx].push_back(id);
-        if self.present & (1 << queue_idx) == 0 {
-            self.present |= 1 << queue_idx;
-        }
+        self.present |= 1 << queue_idx;
     }
     fn pop(&mut self) -> Option<TaskId> {
         let present = self.present;
-        for queue_idx in 0..32 {
-            if present & (1 << queue_idx) != 0 {
-                let q = &mut self.queues[queue_idx];
-                let ret = q.pop_front();
-                if q.is_empty() {
-                    self.present &= !(1 << queue_idx);
-                }
-                return ret;
-            }
+        if present == 0 {
+            return None;
         }
-        None
+        self.iter += 1;
+        if self.iter % 16 == 0 {
+            return self.fair_pop();
+        }
+        let idx = present.trailing_zeros() as usize;
+        self.pop_queue(idx)
     }
     fn clear_task_state(&mut self, _id: TaskId, _gid: u64) {}
     fn clear_group_state(&mut self, gid: u64) {
@@ -67,9 +95,8 @@ impl Scheduler for QLAS {
         self.present != 0
     }
     fn observe(&mut self, _id: TaskId, gid: u64, start: Instant, end: Instant, _ready: bool) {
-        let old = self.service.get(&gid).map_or(0, |s| *s);
-        self.service
-            .insert(gid, old + end.duration_since(start).as_nanos());
+        let diff = end.duration_since(start).as_nanos() as u128;
+        *self.service.entry(gid).or_insert(0) += diff;
     }
 }
 
@@ -91,11 +118,11 @@ mod tests {
         // so it returns task 0 from group 0
         assert_eq!(scheduler.pop(), Some(0));
 
-        // now observe that task 0 was run for 2 nanoseconds
+        // now observe that task 0 was run for 2 microseconds
         let start = Instant::now();
-        let end = start + std::time::Duration::from_nanos(2);
+        let end = start + std::time::Duration::from_micros(2);
         scheduler.observe(0, 0, start, end, true);
-        assert_eq!(*scheduler.service.get(&0).unwrap(), 2);
+        assert_eq!(*scheduler.service.get(&0).unwrap(), 2000);
 
         // now group 0 has service time 2 and group 1 has no service time
         // enqueue a task to both groups 0 and 1
@@ -108,16 +135,16 @@ mod tests {
         assert_eq!(scheduler.pop(), Some(2));
         assert!(!scheduler.is_runnable());
 
-        // now observe that task 3 ran for 6 nanoseconds
-        // and task 2 for 8 nanoseconds
+        // now observe that task 3 ran for 6 microseconds
+        // and task 2 for 8 microseconds
         let start = Instant::now();
-        let end = start + std::time::Duration::from_nanos(6);
+        let end = start + std::time::Duration::from_micros(6);
         scheduler.observe(3, 1, start, end, true);
         let start = Instant::now();
-        let end = start + std::time::Duration::from_nanos(8);
+        let end = start + std::time::Duration::from_micros(8);
         scheduler.observe(2, 0, start, end, true);
-        assert_eq!(*scheduler.service.get(&0).unwrap(), 10);
-        assert_eq!(*scheduler.service.get(&1).unwrap(), 6);
+        assert_eq!(*scheduler.service.get(&0).unwrap(), 10000);
+        assert_eq!(*scheduler.service.get(&1).unwrap(), 6000);
 
         // 10 and 6 go to different queues
         // add two tasks to group 0 and one to group 1
@@ -128,11 +155,11 @@ mod tests {
         assert_eq!(scheduler.pop(), Some(5));
         assert!(scheduler.is_runnable());
 
-        // now observe that task 5 ran for 3 nanoseconds
+        // now observe that task 5 ran for 3 microseconds
         let start = Instant::now();
-        let end = start + std::time::Duration::from_nanos(3);
+        let end = start + std::time::Duration::from_micros(3);
         scheduler.observe(5, 1, start, end, true);
-        assert_eq!(*scheduler.service.get(&1).unwrap(), 9);
+        assert_eq!(*scheduler.service.get(&1).unwrap(), 9000);
 
         // now add a task to group 0 and one to group 1
         scheduler.push(7, 1, now);

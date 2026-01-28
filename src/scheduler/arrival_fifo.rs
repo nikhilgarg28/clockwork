@@ -20,6 +20,10 @@ impl ArrivalFifo {
 }
 
 impl Scheduler for ArrivalFifo {
+    fn init(&mut self, _mpsc: std::sync::Arc<crate::mpsc::Mpsc<TaskId>>) {
+        // ArrivalFifo doesn't use mpsc directly - it builds its own structure in push()
+    }
+    
     fn push(&mut self, id: TaskId, group: u64, at: Instant) {
         match self.arrivals.get_mut(&group) {
             None => {

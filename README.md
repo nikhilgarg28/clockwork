@@ -342,6 +342,35 @@ This design allows you to:
 - Allocate CPU resources between different workload classes (via queue weights)
 - Control latency and fairness within each class (via task schedulers)
 
+## Benchmarks
+
+Clockworker includes several benchmarks to evaluate performance:
+
+- **overhead**: Measures executor overhead
+- **tail_latency**: Measures tail latency under various loads
+- **poll_profile**: Profiles polling behavior
+- **priority**: Tests priority queue behavior (Linux-specific)
+
+### Running Benchmarks on Linux (via Docker)
+
+Some benchmarks use Linux-specific features (e.g., `libc::setpriority`, io_uring). To run these on macOS or any platform, use Docker:
+
+```bash
+# Build the Docker image
+make docker-build
+
+# Run the priority benchmark
+make docker-run-priority
+
+# Run all benchmarks
+make docker-run-all
+
+# Or use docker directly
+docker run clockworker-bench priority
+```
+
+See [README_DOCKER.md](README_DOCKER.md) for detailed Docker usage instructions.
+
 ## Requirements
 
 - Rust 1.70+

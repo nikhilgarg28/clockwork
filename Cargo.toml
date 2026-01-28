@@ -16,6 +16,10 @@ futures = "0.3"
 slab = "0.4"
 static_assertions = "1.1"
 ahash = "0.8"
+crossbeam-queue = "0.3"
+futures-util = "0.3"
+nohash-hasher = "0.2"
+fastrand = "2.0"
 
 [profile.release]
 debug = true
@@ -27,10 +31,14 @@ codegen-units = 1
 tokio = { version = "1", features = ["full", "time", "rt", "macros"] }
 monoio = { version = "0.2" }
 smol = { version = "2.0" }
-rand = { version = "0.8", features = ["std"] }
 hdrhistogram = "7.0"
 async-recursion = "1.1"
 tabled = "0.20"
+pprof = { version = "0.15", features = ["flamegraph", "protobuf-codec"] }
+protobuf = "3.7.2"
+rand = { version = "0.8", features = ["std"] }
+core_affinity = "0.8"
+libc = "0.2"
 
 [[bench]]
 name = "overhead"
@@ -39,3 +47,19 @@ harness = false
 [[bench]]
 name = "tail_latency"
 harness = false
+
+[[bench]]
+name = "poll_profile"
+harness = false
+
+[[bench]]
+name = "priority"
+harness = false
+
+[[bench]]
+name = "overhead_profile"
+harness = false
+
+[profile.samply]
+inherits = "release"
+debug = true

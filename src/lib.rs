@@ -1,6 +1,8 @@
 #![doc = include_str!("../README.md")]
 
 mod executor;
+mod mpsc;
+mod mpsc2;
 mod yield_once;
 
 mod join;

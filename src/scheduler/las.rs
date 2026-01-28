@@ -21,6 +21,10 @@ impl LAS {
     }
 }
 impl Scheduler for LAS {
+    fn init(&mut self, _mpsc: std::sync::Arc<crate::mpsc::Mpsc<TaskId>>) {
+        // LAS doesn't use mpsc directly - it builds its own structure in push()
+    }
+    
     fn push(&mut self, id: TaskId, gid: u64, _at: Instant) {
         let service = self.service.get(&gid).map_or(0, |s| *s);
         self.runnable.insert((service, id), ());

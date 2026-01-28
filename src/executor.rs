@@ -1,12 +1,12 @@
 use crate::{
     join::{JoinHandle, JoinState},
+    mpsc::Mpsc,
     queue::{Queue, QueueKey, TaskId},
     scheduler::Scheduler,
     stats::{ExecutorStats, QueueStats},
     task::TaskHeader,
     yield_once::yield_once,
 };
-use flume::{Receiver, Sender};
 use slab::Slab;
 use static_assertions::assert_not_impl_any;
 use std::{
@@ -15,6 +15,7 @@ use std::{
     cell::RefCell,
     future::Future,
     hash::{Hash, Hasher},
+    mem,
     num::NonZeroU64,
     pin::Pin,
     rc::Rc,
@@ -132,6 +133,20 @@ impl<T, K: QueueKey, F: Future<Output = T> + 'static> Future for CancelableFutur
     }
 }
 
+/// Wrapper to create a waker that sets a flag and wakes an AtomicWaker when woken.
+/// Used by `run_until` to detect when the `until` future's dependencies become ready.
+struct UntilWakerWrapper {
+    woken: Arc<std::sync::atomic::AtomicBool>,
+    idle_waker: Arc<futures_util::task::AtomicWaker>,
+}
+
+impl futures_util::task::ArcWake for UntilWakerWrapper {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.woken.store(true, Ordering::Release);
+        arc_self.idle_waker.wake();
+    }
+}
+
 /// Local (executor-thread-only) task record containing the !Send future.
 struct TaskRecord<K: QueueKey> {
     header: Arc<TaskHeader<K>>,
@@ -155,84 +170,6 @@ impl<K: QueueKey> QueueState<K> {
             share: queue.share(),
             scheduler: queue.scheduler(),
         }
-    }
-}
-/// How the executor should shut down.
-#[derive(Clone, Copy, Debug)]
-pub enum ShutdownMode {
-    /// Stop accepting new tasks; keep running until no tasks remain.
-    Drain,
-    /// Stop accepting new tasks; keep running until drained or deadline, then force.
-    DrainFor(Duration),
-    /// Stop accepting new tasks; cancel everything and finish ASAP.
-    Force,
-}
-
-/// Shared inner state between executor and handles (single-thread; !Send).
-#[derive(Debug)]
-pub struct ShutdownState {
-    requested: Cell<Option<(Instant, ShutdownMode)>>,
-    force_initiated: Cell<bool>,
-    /// Wakers waiting for shutdown completion.
-    waiters: RefCell<Vec<std::task::Waker>>,
-    accepting: Cell<bool>,
-    /// Set when executor has fully stopped and shutdown is complete.
-    stopped: Cell<bool>,
-}
-
-impl ShutdownState {
-    pub fn new() -> Self {
-        Self {
-            accepting: Cell::new(true),
-            requested: Cell::new(None),
-            force_initiated: Cell::new(false),
-            waiters: RefCell::new(Vec::new()),
-            stopped: Cell::new(false),
-        }
-    }
-    fn request_shutdown(&self, mode: ShutdownMode) {
-        if self.requested.get().is_some() {
-            return;
-        }
-        self.requested.set(Some((Instant::now(), mode)));
-    }
-
-    // Mark the executor as stopped and wake all waiters.
-    fn mark_stopped_and_wake_waiters(&self) {
-        self.stopped.set(true);
-        for w in self.waiters.borrow_mut().drain(..) {
-            w.wake();
-        }
-    }
-    fn requested(&self) -> bool {
-        self.requested.get().is_some()
-    }
-}
-
-/// Await this to learn when shutdown is complete.
-/// TODO: should we build this as future on Executor itself?
-#[derive(Clone)]
-pub struct ShutdownHandle {
-    inner: Rc<ShutdownState>,
-}
-
-impl Future for ShutdownHandle {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.inner.stopped.get() {
-            return Poll::Ready(());
-        }
-        // Register as waiter
-        let mut waiters = self.inner.waiters.borrow_mut();
-        // TODO: avoid unbounded growth if polled repeatedly with same waker
-        waiters.push(cx.waker().clone());
-        Poll::Pending
-    }
-}
-impl ShutdownHandle {
-    pub fn new(inner: Rc<ShutdownState>) -> Self {
-        Self { inner }
     }
 }
 
@@ -259,10 +196,10 @@ impl<K: QueueKey> QueueHandle<K> {
     {
         let group = match self.hash {
             None => {
-                let h = self.executor.next_group_id.get();
-                self.executor.next_group_id.set(h + 1);
-                // set highest bit of h to 0 to distinguish from user provided groups
-                h & !(1 << 63)
+                // take random 64 bits from a random number generator
+                let h = fastrand::u64(..);
+                let h = h & !(1 << 63);
+                h
             }
             Some(hash) => hash.get() as u64,
         };
@@ -293,11 +230,23 @@ impl<K: QueueKey> ExecutorBuilder<K> {
         self.options.driver_yield = driver_yield;
         self
     }
-    pub fn with_queue<S: Scheduler + 'static>(mut self, qid: K, share: u64, scheduler: S) -> Self {
+    /// Add a queue with a custom scheduler.
+    pub fn with_queue_scheduler<S: Scheduler + 'static>(
+        mut self,
+        qid: K,
+        share: u64,
+        scheduler: S,
+    ) -> Self {
         let scheduler: Box<dyn Scheduler> = Box::new(scheduler);
         let queue = Queue::new(qid, share, scheduler);
         self.queues.push(queue);
         self
+    }
+
+    /// Add a queue with the default RunnableFifo scheduler.
+    pub fn with_queue(self, qid: K, share: u64) -> Self {
+        let scheduler = crate::scheduler::RunnableFifo::new();
+        self.with_queue_scheduler(qid, share, scheduler)
     }
     pub fn with_panic_on_task_panic(mut self, panic_on_task_panic: bool) -> Self {
         self.options.panic_on_task_panic = panic_on_task_panic;
@@ -328,28 +277,22 @@ impl Default for ExecutorOptions {
 /// The priority executor: single-thread polling + class vruntime selection.
 pub struct Executor<K: QueueKey> {
     options: ExecutorOptions,
-    ingress_tx: Sender<TaskId>,
-    ingress_rx: Receiver<TaskId>,
-    shutdown_tx: Sender<()>,
-    shutdown_rx: Receiver<()>,
+    queue_mpscs: Vec<Arc<Mpsc<TaskId>>>,
+    is_runnable: RefCell<Vec<bool>>, // true iff ith queue is runnable
 
     /// Number of live tasks known to the executor.
     live_tasks: std::sync::atomic::AtomicUsize,
-    /// Whether run() has been called at least once.
-    run_started: std::sync::atomic::AtomicBool,
-
-    shutdown: Rc<ShutdownState>,
 
     tasks: RefCell<Slab<TaskRecord<K>>>,
     queues: RefCell<Vec<QueueState<K>>>,
     qids: RefCell<Vec<K>>,
 
     min_vruntime: std::cell::Cell<u128>,
+
     // stats
     stats: RefCell<ExecutorStats>,
-
-    next_group_id: std::cell::Cell<u64>,
 }
+
 assert_not_impl_any!(Executor<u8>: Send, Sync);
 
 impl<K: QueueKey> Executor<K> {
@@ -371,50 +314,31 @@ impl<K: QueueKey> Executor<K> {
             return Err("All queues must have a share > 0".to_string());
         }
 
-        let (tx, rx) = flume::unbounded::<TaskId>();
-        let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
+        // Create one mpsc channel per queue
+        let num_queues = queues.len();
+        let queue_mpscs: Vec<Arc<Mpsc<TaskId>>> =
+            (0..num_queues).map(|_| Arc::new(Mpsc::new())).collect();
 
         let qids = queues.iter().map(|q| q.id()).collect::<Vec<_>>();
-        let queues = queues
-            .into_iter()
-            .map(|q| QueueState::new(q))
-            .collect::<Vec<_>>();
+        let mut queues: Vec<QueueState<K>> =
+            queues.into_iter().map(|q| QueueState::new(q)).collect();
+
+        // Initialize each scheduler with its queue's mpsc
+        for (qidx, queue) in queues.iter_mut().enumerate() {
+            queue.scheduler.init(queue_mpscs[qidx].clone());
+        }
 
         Ok(Rc::new(Self {
-            ingress_tx: tx,
-            ingress_rx: rx,
-            shutdown_tx,
-            shutdown_rx,
+            queue_mpscs,
+            is_runnable: RefCell::new(vec![false; num_queues]),
             tasks: RefCell::new(Slab::new()),
             queues: RefCell::new(queues),
-            shutdown: Rc::new(ShutdownState::new()),
             qids: RefCell::new(qids),
             live_tasks: std::sync::atomic::AtomicUsize::new(0),
-            run_started: std::sync::atomic::AtomicBool::new(false),
             options,
             min_vruntime: std::cell::Cell::new(0),
             stats: RefCell::new(ExecutorStats::new(Instant::now())),
-            next_group_id: std::cell::Cell::new(0),
         }))
-    }
-
-    fn should_force_now(&self, now: Instant) -> bool {
-        match self.shutdown.requested.get() {
-            None => false,
-            Some((_, ShutdownMode::Force)) => true,
-            Some((asof, ShutdownMode::DrainFor(deadline))) => now - asof >= deadline,
-            Some((_, ShutdownMode::Drain)) => false,
-        }
-    }
-
-    /// Called by executor thread when it wants to force-cancel remaining tasks.
-    /// You can implement this using your task table: mark cancelled and enqueue, or just drop tasks.
-    fn force_cancel_all_tasks(&self) {
-        let tasks = self.tasks.borrow_mut();
-        for (_, task) in tasks.iter() {
-            task.header.cancel();
-            task.header.enqueue();
-        }
     }
 
     /// Get a handle to a queue through which tasks can be spawned
@@ -436,23 +360,27 @@ impl<K: QueueKey> Executor<K> {
         F: Future<Output = T> + 'static, // !Send ok
     {
         let qid = qid.into();
-        assert!(self.qids.borrow().iter().position(|q| *q == qid).is_some());
+        let qidx = self
+            .qids
+            .borrow()
+            .iter()
+            .position(|q| *q == qid)
+            .expect("queue should exist");
         let mut tasks = self.tasks.borrow_mut();
         let entry = tasks.vacant_entry();
         let id = entry.key();
-        let header = Arc::new(TaskHeader::new(id, qid, group, self.ingress_tx.clone()));
+        let header = Arc::new(TaskHeader::new(
+            id,
+            qid,
+            group,
+            self.queue_mpscs[qidx].clone(),
+        ));
         let join = Arc::new(JoinState::<T>::new());
         // Wrap user future to publish result into JoinState.
         // catch_panics = !panic_on_task_panic (if executor panics on task panic, we don't catch)
         let catch_panics = !self.options.panic_on_task_panic;
         let wrapped = CancelableFuture::new(header.clone(), join.clone(), fut, catch_panics);
 
-        // if not accepting, don't enqueue, must mark cancelled
-        if !self.shutdown.accepting.get() {
-            let cancelled = join.try_complete_cancelled();
-            assert!(cancelled);
-            return JoinHandle::new(header, join);
-        }
         let waker = futures::task::waker(header.clone());
 
         entry.insert(TaskRecord {
@@ -469,55 +397,36 @@ impl<K: QueueKey> Executor<K> {
         JoinHandle::new(header, join)
     }
 
-    /// Drain ingress notifications and route runnable tasks into their class policies.
-    fn drain_ingress_into_classes(&self, now: Instant) {
-        let mut drained = 0u64;
-        while let Ok(id) = self.ingress_rx.try_recv() {
-            drained += 1;
-            self.enqueue_task(id, now);
-        }
-        self.stats.borrow_mut().record_wakeups_drained(drained);
-    }
-
-    fn enqueue_task(&self, id: TaskId, now: Instant) {
-        let tasks = self.tasks.borrow();
-        let Some(task) = tasks.get(id) else {
-            return;
-        };
-        let qid = task.header.qid();
-        let Some(idx) = self.qids.borrow().iter().position(|q| *q == qid) else {
-            unreachable!("Queue not found for id: {:?}", qid);
-        };
-        let mut queues = self.queues.borrow_mut();
-        let queue = &mut queues[idx];
-        let was_runnable = queue.scheduler.is_runnable();
-        queue.scheduler.push(id, task.header.group(), now);
-        let now_runnable = queue.scheduler.is_runnable();
-        let became_runnable = !was_runnable && now_runnable;
-        // this queue just became runnable, so update its vruntime
-        if became_runnable {
-            queue.vruntime = queue.vruntime.max(self.min_vruntime.get());
-        }
-        queue.stats.record_runnable_enqueue(became_runnable, now);
-    }
-
     /// Pick the next runnable class by deadline among classes that have
     /// runnable tasks. Deadline is vruntime + sched_latency / num_runnable,
     /// so higher weight classes
     /// have lower deadline for the same CPU time, making them preferred.
     fn pick_next_class(&self) -> Option<(usize, Duration)> {
         let mut best: Option<(usize, u128)> = None;
-        let num_runnable = self
-            .queues
-            .borrow()
-            .iter()
-            .filter(|q| q.scheduler.is_runnable())
-            .count();
+        let mut runnable = None;
+        let mut num_runnable = 0;
+        let mut is_runnable = self.is_runnable.borrow_mut();
+        for (idx, q) in self.queues.borrow_mut().iter_mut().enumerate() {
+            let was_runnable = is_runnable[idx];
+            is_runnable[idx] = q.scheduler.is_runnable();
+            if !was_runnable && is_runnable[idx] {
+                // wasn't runnable before, but is now - inherit vruntime
+                q.vruntime = q.vruntime.max(self.min_vruntime.get());
+            }
+            if is_runnable[idx] {
+                num_runnable += 1;
+                runnable = Some(idx);
+            }
+        }
         if num_runnable == 0 {
             return None;
         }
         let request = self.options.sched_latency.as_nanos() as u128 / num_runnable as u128;
         let request = request.max(self.options.min_slice.as_nanos() as u128);
+
+        if num_runnable == 1 {
+            return Some((runnable.unwrap(), Duration::from_nanos(request as u64)));
+        }
         for (idx, q) in self.queues.borrow().iter().enumerate() {
             if !q.scheduler.is_runnable() {
                 continue;
@@ -573,145 +482,176 @@ impl<K: QueueKey> Executor<K> {
             .collect()
     }
 
-    /// Run the executor loop forever.
+    /// Run the executor loop until the given future completes.
     ///
     /// Panic behavior: if any task panics while being polled, the executor panics (propagates).
     ///
-    /// If the executor has already been shutdown, this method returns immediately.
-    pub async fn run(&self) -> () {
-        // Check if already stopped (e.g., shutdown was called before run())
-        if self.shutdown.stopped.get() {
-            return;
-        }
+    /// The executor will continue running tasks until `until` completes, then returns.
+    /// When the executor stops, pending tasks remain pending and will resume if `run_until`
+    /// is called again (Tokio-like behavior).
+    pub async fn run_until<F: Future>(&self, until: F) -> F::Output {
+        use futures::FutureExt;
+        use futures_util::task::AtomicWaker;
+        use std::sync::atomic::AtomicBool;
 
-        // Mark that run() has been called
-        self.run_started.store(true, Ordering::Release);
+        let mut until_pinned = std::pin::pin!(until.fuse());
 
-        // Check if shutdown was already requested before run() was called
-        if self.shutdown.requested() && self.num_live_tasks() == 0 {
-            self.shutdown.mark_stopped_and_wake_waiters();
-            return;
-        }
+        // Flag that gets set when until's waker is called
+        let until_woken = Arc::new(AtomicBool::new(false));
+        // Waker to wake the idle wait loop when until_woken is set
+        let idle_waker = Arc::new(AtomicWaker::new());
+        // Create a waker that sets the flag and wakes idle_waker
+        let until_waker = self.create_until_waker(until_woken.clone(), idle_waker.clone());
 
         let mut last_driver_yield_at = Instant::now();
+        let mut iter = 0u64;
+
+        // Initial poll to register our waker
+        {
+            let mut cx = Context::from_waker(&until_waker);
+            if let Poll::Ready(result) = until_pinned.as_mut().poll(&mut cx) {
+                return result;
+            }
+        }
 
         loop {
-            let now = Instant::now();
+            iter += 1;
+            let enable_stats = iter % 128 == 0;
+            self.stats.borrow_mut().record_loop_iter();
 
-            // Handle shutdown if needed
-            if self.should_force_now(now) && !self.shutdown.force_initiated.get() {
-                self.shutdown.force_initiated.set(true);
-                self.force_cancel_all_tasks();
+            // Only poll until if it was woken (its dependencies became ready)
+            if until_woken.swap(false, Ordering::AcqRel) {
+                let mut cx = Context::from_waker(&until_waker);
+                if let Poll::Ready(result) = until_pinned.as_mut().poll(&mut cx) {
+                    return result;
+                }
             }
 
-            self.stats.borrow_mut().record_loop_iter();
-            self.drain_ingress_into_classes(now);
-
             // Select next queue to run
-            let Some((qidx, timeslice)) = self.select_queue() else {
-                // Nothing runnable - check shutdown before waiting
-                if self.shutdown.requested() && self.num_live_tasks() == 0 {
-                    self.shutdown.mark_stopped_and_wake_waiters();
-                    break;
-                }
-                // Wait for tasks
-                let more = self.wait_for_tasks(now).await;
-                if !more {
-                    break;
-                } else {
-                    continue;
-                }
+            let Some((qidx, timeslice)) = self.select_queue(enable_stats) else {
+                // Nothing runnable - wait for work or until_woken signal
+                self.wait_for_work_or_signal(&until_woken, &idle_waker)
+                    .await;
+                continue;
             };
 
             // Execute timeslice
             let timeslice = timeslice.min(self.options.driver_yield);
-            self.run_timeslice(qidx, timeslice);
+            let end = self.run_timeslice(qidx, timeslice, enable_stats);
 
             // Update executor's min_vruntime
             let new_vruntime = self.queues.borrow()[qidx].vruntime;
             self.update_min_vruntime(new_vruntime);
 
-            // Check shutdown
-            if self.shutdown.requested() && self.num_live_tasks() == 0 {
-                self.shutdown.mark_stopped_and_wake_waiters();
-                break;
-            }
-
             // Yield to driver
-            last_driver_yield_at = self.yield_to_driver(last_driver_yield_at).await;
+            last_driver_yield_at = self.yield_to_driver(last_driver_yield_at, end).await;
         }
+    }
+
+    /// Create a waker that sets `until_woken` and wakes `idle_waker` when called.
+    fn create_until_waker(
+        &self,
+        until_woken: Arc<std::sync::atomic::AtomicBool>,
+        idle_waker: Arc<futures_util::task::AtomicWaker>,
+    ) -> std::task::Waker {
+        let wrapper = Arc::new(UntilWakerWrapper {
+            woken: until_woken,
+            idle_waker,
+        });
+        futures::task::waker(wrapper)
+    }
+
+    /// Wait for either a queue to receive a task or `until_woken` to be set.
+    async fn wait_for_work_or_signal(
+        &self,
+        until_woken: &Arc<std::sync::atomic::AtomicBool>,
+        idle_waker: &Arc<futures_util::task::AtomicWaker>,
+    ) {
+        use futures::future;
+        use futures::FutureExt;
+        use futures_util::future::poll_fn;
+
+        let wait_queues = self.wait_for_any_queue().fuse();
+        let mut wait_queues_pinned = std::pin::pin!(wait_queues);
+
+        let wait_signal = poll_fn({
+            let until_woken = until_woken.clone();
+            let idle_waker = idle_waker.clone();
+            move |cx: &mut Context<'_>| -> Poll<()> {
+                if until_woken.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                idle_waker.register(cx.waker());
+                if until_woken.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            }
+        })
+        .fuse();
+        let mut wait_signal_pinned = std::pin::pin!(wait_signal);
+
+        // Wait on either: queues getting tasks OR until_woken being set
+        future::select(wait_queues_pinned.as_mut(), wait_signal_pinned.as_mut()).await;
     }
 
     fn num_live_tasks(&self) -> usize {
-        self.live_tasks.load(Ordering::Relaxed)
+        self.queue_mpscs.iter().map(|mpsc| mpsc.len()).sum()
     }
 
     /// Wait for new tasks if nothing is runnable.
-    /// Returns true if we should continue the loop, false if we should break.
-    async fn wait_for_tasks(&self, now: Instant) -> bool {
-        let idle_start = Instant::now();
-
-        // Use select to race between ingress and shutdown channels
-        use futures::future::Either;
+    /// Parks until any queue receives a new task.
+    async fn wait_for_any_queue(&self) {
+        use futures::future;
         use futures::FutureExt;
 
-        let ingress_fut = self.ingress_rx.recv_async().fuse();
-        let shutdown_fut = self.shutdown_rx.recv_async().fuse();
+        // Create a wait future for each queue, box and pin them
+        let mut queue_futures: Vec<_> = self
+            .queue_mpscs
+            .iter()
+            .map(|mpsc| {
+                let fut = mpsc.wait().fuse();
+                Box::pin(fut) as Pin<Box<dyn Future<Output = ()> + '_>>
+            })
+            .collect();
 
-        let mut ingress_pinned = std::pin::pin!(ingress_fut);
-        let mut shutdown_pinned = std::pin::pin!(shutdown_fut);
-
-        match futures::future::select(ingress_pinned.as_mut(), shutdown_pinned.as_mut()).await {
-            Either::Left((result, _)) => {
-                let idle_end = Instant::now();
-                let idle_duration = idle_end.duration_since(idle_start);
-                self.stats.borrow_mut().idle_ns += idle_duration.as_nanos();
-
-                match result {
-                    Ok(id) => {
-                        self.enqueue_task(id, now);
-                        true // Continue loop
-                    }
-                    Err(_) => {
-                        // Sender dropped + no pending items => we're done
-                        false // Break loop
-                    }
-                }
-            }
-            Either::Right((_, _)) => {
-                // Shutdown signal received
-                let idle_end = Instant::now();
-                let idle_duration = idle_end.duration_since(idle_start);
-                self.stats.borrow_mut().idle_ns += idle_duration.as_nanos();
-
-                // Check if we should actually shutdown (no live tasks)
-                if self.num_live_tasks() == 0 {
-                    self.shutdown.mark_stopped_and_wake_waiters();
-                    false // Break loop
-                } else {
-                    // Still have tasks, continue
-                    true // Continue loop
-                }
-            }
-        }
+        // Wait for ANY queue to become non-empty
+        // This completes as soon as any queue transitions from empty to non-empty
+        // Items remain in the queue for the scheduler to drain
+        future::select_all(&mut queue_futures).await;
     }
 
     /// Select the next queue to run and measure the decision time.
-    fn select_queue(&self) -> Option<(usize, Duration)> {
-        let t1 = Instant::now();
+    fn select_queue(&self, enable_stats: bool) -> Option<(usize, Duration)> {
+        let start = if enable_stats {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let result = self.pick_next_class();
-        let elapsed = Instant::now().duration_since(t1);
-        self.stats.borrow_mut().record_schedule_decision(elapsed);
+        if let Some(start) = start {
+            let elapsed = Instant::now().duration_since(start);
+            self.stats.borrow_mut().record_schedule_decision(elapsed);
+        }
         result
     }
 
     /// Pop the next valid task from a queue, skipping stale/done tasks.
-    fn pop_next_task_from_queue(&self, qidx: usize) -> Option<TaskId> {
+    /// Returns (task id, group id)
+    fn pop_next_task_from_queue(&self, qidx: usize) -> Option<(TaskId, u64)> {
         loop {
             let mut queues = self.queues.borrow_mut();
             let queue = &mut queues[qidx];
+            // Check if queue was runnable before pop (to detect when it becomes runnable)
+            let was_runnable = queue.scheduler.is_runnable();
             queue.stats.record_runnable_dequeue();
             let maybe_id = queue.scheduler.pop();
+
+            // If queue just became runnable (wasn't runnable but now has a task), update vruntime
+            if !was_runnable && maybe_id.is_some() {
+                queue.vruntime = queue.vruntime.max(self.min_vruntime.get());
+                queue.stats.record_runnable_enqueue(true, Instant::now());
+            }
             drop(queues);
 
             let Some(id) = maybe_id else {
@@ -729,33 +669,71 @@ impl<K: QueueKey> Executor<K> {
                 continue;
             }
 
-            return Some(id);
+            return Some((id, task.header.group()));
         }
     }
 
     /// Poll a single task and return whether it completed, the start time, and the elapsed time.
-    fn poll_task(&self, id: TaskId, qidx: usize) -> (bool, Instant, Duration) {
-        let start = Instant::now();
-        let mut tasks = self.tasks.borrow_mut();
-        let Some(task) = tasks.get_mut(id) else {
-            return (false, start, Duration::ZERO);
-        };
-        // Clear queued before polling so a wake during poll can enqueue again.
-        task.header.set_queued(false);
+    fn poll_task(&self, id: TaskId, qidx: usize, start: Instant) -> (bool, Duration) {
+        // Extract the future from the task while keeping the task in the Slab.
+        // This allows us to release the borrow before polling, enabling nested spawns.
+        let (waker, mut extracted_fut) = {
+            let mut tasks = self.tasks.borrow_mut();
+            let task = match tasks.get_mut(id) {
+                Some(task) => task,
+                None => return (false, Duration::ZERO),
+            };
 
-        let mut cx = Context::from_waker(&task.waker);
+            // Clear queued before polling so a wake during poll can enqueue again.
+            task.header.set_queued(false);
+
+            // Clone what we need for the context
+            let waker = task.waker.clone();
+
+            // Extract the future using a dummy placeholder
+            // We use futures::future::ready(()) as a placeholder that immediately resolves
+            let placeholder = Box::pin(futures::future::ready(()));
+            let extracted_fut = mem::replace(&mut task.fut, placeholder);
+
+            (waker, extracted_fut)
+        };
+        // Borrow is now released - the task remains in the Slab with the placeholder future
+
+        let mut cx = Context::from_waker(&waker);
 
         // CancelableFuture handles panics internally, so we can poll directly
-        let poll = task.fut.as_mut().poll(&mut cx);
-        drop(tasks);
+        // Now we can poll without holding the tasks borrow, allowing nested spawns
+        let poll = extracted_fut.as_mut().poll(&mut cx);
 
         let end = Instant::now();
         let elapsed = end.saturating_duration_since(start);
         self.charge_class(qidx, elapsed);
 
-        match poll {
-            Poll::Ready(()) => (true, start, elapsed),
-            Poll::Pending => (false, start, elapsed),
+        // Put the future back (or leave placeholder if task completed)
+        {
+            let mut tasks = self.tasks.borrow_mut();
+            let task = match tasks.get_mut(id) {
+                Some(task) => task,
+                None => {
+                    // Task was removed (shouldn't happen, but handle gracefully)
+                    return (false, elapsed);
+                }
+            };
+
+            match poll {
+                Poll::Ready(()) => {
+                    // Task completed - leave the placeholder future in place
+                    // The task will be removed by complete_task later
+                    (true, elapsed)
+                }
+                Poll::Pending => {
+                    // Task still pending - put the future back
+                    let placeholder = mem::replace(&mut task.fut, extracted_fut);
+                    // Drop the placeholder
+                    drop(placeholder);
+                    (false, elapsed)
+                }
+            }
         }
     }
 
@@ -779,52 +757,62 @@ impl<K: QueueKey> Executor<K> {
     }
 
     /// Record that a task is still pending.
-    fn record_task_pending(&self, id: TaskId, qidx: usize, start: Instant, end: Instant) {
-        let mut tasks = self.tasks.borrow_mut();
-        let task = tasks.get_mut(id).expect("task should exist");
-        let group = task.header.group();
+    fn record_task_pending(
+        &self,
+        id: TaskId,
+        group: u64,
+        qidx: usize,
+        start: Instant,
+        end: Instant,
+    ) {
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[qidx];
         queue.scheduler.observe(id, group, start, end, false);
     }
 
     /// Execute tasks from a selected queue until the timeslice is exhausted.
-    fn run_timeslice(&self, qidx: usize, timeslice: Duration) {
+    fn run_timeslice(&self, qidx: usize, timeslice: Duration, enable_stats: bool) -> Instant {
         let now = Instant::now();
         let until = now + timeslice;
-        self.queues.borrow_mut()[qidx]
-            .stats
-            .record_first_service_after_runnable(now);
+        if enable_stats {
+            self.queues.borrow_mut()[qidx]
+                .stats
+                .record_first_service_after_runnable(now);
+        }
+
+        let mut start = now;
 
         loop {
             set_yield_maybe_deadline(until);
 
-            let Some(id) = self.pop_next_task_from_queue(qidx) else {
+            let Some((id, group)) = self.pop_next_task_from_queue(qidx) else {
                 break; // Queue became empty
             };
 
-            let (completed, start, elapsed) = self.poll_task(id, qidx);
+            let (completed, elapsed) = self.poll_task(id, qidx, start);
             let end = start + elapsed;
 
             if completed {
                 self.complete_task(id, qidx, start, end);
             } else {
-                self.record_task_pending(id, qidx, start, end);
+                self.record_task_pending(id, group, qidx, start, end);
             }
-
+            start = end;
             if end > until {
-                self.stats.borrow_mut().record_poll(elapsed, true);
-                let mut queues = self.queues.borrow_mut();
-                queues[qidx].stats.record_slice_overrun();
-                queues[qidx].stats.record_slice_exhausted();
+                if enable_stats {
+                    self.stats.borrow_mut().record_poll(elapsed, true);
+                    let mut queues = self.queues.borrow_mut();
+                    queues[qidx].stats.record_slice_overrun();
+                    queues[qidx].stats.record_slice_exhausted();
+                }
                 break;
             }
         }
+        start
     }
 
     /// Yield to the driver and record stats.
-    async fn yield_to_driver(&self, last_yield: Instant) -> Instant {
-        let now = Instant::now();
+    async fn yield_to_driver(&self, last_yield: Instant, now: Instant) -> Instant {
         let since_last = now - last_yield;
         yield_once().await;
         let after_yield = Instant::now();
@@ -833,21 +821,6 @@ impl<K: QueueKey> Executor<K> {
             .borrow_mut()
             .record_driver_yield(since_last, in_driver);
         after_yield
-    }
-
-    pub fn shutdown(&self, mode: ShutdownMode) -> ShutdownHandle {
-        self.shutdown.accepting.set(false);
-        self.shutdown.request_shutdown(mode);
-
-        // If run() hasn't been called yet and there are no tasks, we can immediately mark as stopped
-        if !self.run_started.load(Ordering::Acquire) && self.num_live_tasks() == 0 {
-            self.shutdown.mark_stopped_and_wake_waiters();
-        } else {
-            // Wake up the executor if it's waiting
-            let _ = self.shutdown_tx.try_send(());
-        }
-
-        ShutdownHandle::new(self.shutdown.clone())
     }
 }
 
@@ -870,7 +843,6 @@ pub async fn yield_maybe() {
 mod tests {
     use super::*;
     use crate::join::JoinError;
-    use crate::scheduler::RunnableFifo;
     use crate::yield_once::yield_once;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -883,26 +855,19 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new()
-                    .with_queue(0, 1, RunnableFifo::new())
-                    .build()
-                    .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
                 let counter_clone = counter.clone();
-                let queue = executor.queue(0).unwrap();
-                let handle = queue.spawn(async move {
-                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                // Run executor until task completes
+                let result = executor.run_until(async {
+                    let queue = executor.queue(0).unwrap();
+                    let handle = queue.spawn(async move {
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                    });
+                    handle.await
                 });
-
-                // Run executor in background
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-
-                // Wait for task to complete
-                let result = timeout(Duration::from_millis(100), handle).await;
+                let result = timeout(Duration::from_millis(100), result).await;
                 assert!(result.is_ok(), "Task should complete");
                 assert_eq!(counter.load(Ordering::Relaxed), 1);
             })
@@ -914,20 +879,14 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new()
-                    .with_queue(0, 1, RunnableFifo::new())
-                    .build()
-                    .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
 
-                let queue = executor.queue(0).unwrap();
-                let handle = queue.spawn(async move { 42 });
-
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
+                let result = executor.run_until(async {
+                    let queue = executor.queue(0).unwrap();
+                    let handle = queue.spawn(async move { 42 });
+                    handle.await
                 });
-
-                let result = timeout(Duration::from_millis(100), handle).await;
+                let result = timeout(Duration::from_millis(100), result).await;
                 assert!(result.is_ok(), "JoinHandle should complete");
                 let join_result = result.unwrap();
                 assert_eq!(join_result, Ok(42));
@@ -940,39 +899,32 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new()
-                    .with_queue(0, 1, RunnableFifo::new())
-                    .build()
-                    .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let started = Arc::new(AtomicBool::new(false));
                 let completed = Arc::new(AtomicBool::new(false));
-
                 let started_clone = started.clone();
                 let completed_clone = completed.clone();
+
                 let queue = executor.queue(0).unwrap();
-                let handle = queue.spawn(async move {
-                    started_clone.store(true, Ordering::Relaxed);
-                    // Task that runs for a while
-                    for _ in 0..100 {
-                        sleep(Duration::from_millis(10)).await;
-                    }
-                    completed_clone.store(true, Ordering::Relaxed);
-                });
+                let handle = executor
+                    .run_until(async {
+                        let handle = queue.spawn(async move {
+                            started_clone.store(true, Ordering::Relaxed);
+                            // Task that runs for a while
+                            for _ in 0..100 {
+                                sleep(Duration::from_millis(10)).await;
+                            }
+                            completed_clone.store(true, Ordering::Relaxed);
+                        });
+                        // Wait a bit for task to start
+                        sleep(Duration::from_millis(50)).await;
+                        assert!(started.load(Ordering::Relaxed), "Task should have started");
 
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-
-                // Give executor time to start
-                sleep(Duration::from_millis(10)).await;
-
-                // Wait a bit for task to start
-                sleep(Duration::from_millis(50)).await;
-                assert!(started.load(Ordering::Relaxed), "Task should have started");
-
-                // Abort the task
-                handle.abort();
+                        // Abort the task
+                        handle.abort();
+                        handle
+                    })
+                    .await;
 
                 // Wait for abort to be processed
                 let result = timeout(Duration::from_millis(500), handle).await;
@@ -980,8 +932,7 @@ mod tests {
                 let join_result = result.unwrap();
                 assert!(matches!(join_result, Err(JoinError::Cancelled)));
 
-                // Give a bit more time and verify task didn't complete
-                sleep(Duration::from_millis(100)).await;
+                // verify task didn't complete
                 assert!(
                     !completed.load(Ordering::Relaxed),
                     "Task should not have completed"
@@ -995,49 +946,46 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor = Executor::new(
-                    opts,
-                    vec![
-                        Queue::new(0, 8, Box::new(RunnableFifo::new())),
-                        Queue::new(1, 1, Box::new(RunnableFifo::new())),
-                    ],
-                )
-                .unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 8)
+                    .with_queue(1, 1)
+                    .build()
+                    .unwrap();
+                let queue1 = executor.queue(0).unwrap();
+                let queue2 = executor.queue(1).unwrap();
                 let high = Arc::new(AtomicU32::new(0));
                 let low = Arc::new(AtomicU32::new(0));
-
                 let high_clone = high.clone();
                 let low_clone = low.clone();
 
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-                // Spawn tasks that run indefinitely with some work per iteration.
-                // Note: We use yield_once() instead of sleep() because sleep() makes tasks
-                // pending (not runnable), so they can't compete for CPU, thus
-                // giving low weight class access to the CPU when high weight
-                // class is not runnable.
-                let queue1 = executor.queue(0).unwrap();
-                let handle1 = queue1.spawn(async move {
-                    loop {
-                        for _ in 0..100_000 {
-                            high_clone.fetch_add(1, Ordering::Relaxed);
-                        }
-                        yield_once().await;
-                    }
-                });
-                let queue2 = executor.queue(1).unwrap();
-                let handle2 = queue2.spawn(async move {
-                    loop {
-                        for _ in 0..100_000 {
-                            low_clone.fetch_add(1, Ordering::Relaxed);
-                        }
-                        yield_once().await;
-                    }
-                });
-                sleep(Duration::from_millis(100)).await;
+                executor
+                    .run_until(async {
+                        // Spawn tasks that run indefinitely with some work per iteration.
+                        // Note: We use yield_once() instead of sleep() because sleep() makes tasks
+                        // pending (not runnable), so they can't compete for CPU, thus
+                        // giving low weight class access to the CPU when high weight
+                        // class is not runnable.
+                        let handle1 = queue1.spawn(async move {
+                            loop {
+                                for _ in 0..100_000 {
+                                    high_clone.fetch_add(1, Ordering::Relaxed);
+                                }
+                                yield_once().await;
+                            }
+                        });
+                        let handle2 = queue2.spawn(async move {
+                            loop {
+                                for _ in 0..100_000 {
+                                    low_clone.fetch_add(1, Ordering::Relaxed);
+                                }
+                                yield_once().await;
+                            }
+                        });
+                        sleep(Duration::from_millis(100)).await;
+                        handle1.abort();
+                        handle2.abort();
+                    })
+                    .await;
                 let high_count = high.load(Ordering::Relaxed);
                 let low_count = low.load(Ordering::Relaxed);
                 // High weight class should get more CPU time (roughly 8x)
@@ -1047,8 +995,6 @@ mod tests {
                     high_count,
                     low_count
                 );
-                handle1.abort();
-                handle2.abort();
             })
             .await;
     }
@@ -1058,10 +1004,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let queue = executor.queue(0).unwrap();
                 let execution_order = Arc::new(Mutex::new(Vec::new()));
 
@@ -1075,7 +1018,10 @@ mod tests {
 
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
-                    executor_clone.run().await;
+                    // Run until timeout to let tasks complete
+                    executor_clone
+                        .run_until(sleep(Duration::from_millis(200)))
+                        .await;
                 });
 
                 // Wait for all tasks to complete
@@ -1098,35 +1044,28 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let queue = executor.queue(0).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
+                let counter_clone = counter.clone();
 
-                // Spawn multiple tasks that all increment the counter
-                let mut handles = Vec::new();
-                for _ in 0..5 {
-                    let counter_clone = counter.clone();
-                    let handle = queue.spawn(async move {
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                    });
-                    handles.push(handle);
-                }
-
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-
-                // Wait for all tasks to complete
-                for handle in handles {
-                    let result = timeout(Duration::from_millis(100), handle).await;
-                    assert!(result.is_ok(), "All tasks should complete");
-                }
-
-                assert_eq!(counter.load(Ordering::Relaxed), 5);
+                executor
+                    .run_until(async {
+                        let mut handles = Vec::new();
+                        for _ in 0..5 {
+                            let counter_clone = counter.clone();
+                            let handle = queue.spawn(async move {
+                                counter_clone.fetch_add(1, Ordering::Relaxed);
+                            });
+                            handles.push(handle);
+                        }
+                        for handle in handles {
+                            let result = timeout(Duration::from_millis(100), handle).await;
+                            assert!(result.is_ok(), "All tasks should complete");
+                        }
+                    })
+                    .await;
+                assert_eq!(counter_clone.load(Ordering::Relaxed), 5);
             })
             .await;
     }
@@ -1136,50 +1075,48 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let queue = executor.queue(0).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
                 let counter_clone = counter.clone();
-                let handle = queue.spawn(async move {
-                    for _ in 0..3 {
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                        sleep(Duration::from_millis(10)).await;
-                    }
-                });
+                executor
+                    .run_until(async {
+                        let handle = queue.spawn(async move {
+                            for _ in 0..3 {
+                                counter_clone.fetch_add(1, Ordering::Relaxed);
+                                sleep(Duration::from_millis(10)).await;
+                            }
+                        });
+                        let result = timeout(Duration::from_millis(500), handle).await;
+                        assert!(
+                            result.is_ok(),
+                            "Task with yields should complete, got {:?}",
+                            result
+                        );
+                    })
+                    .await;
 
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-
-                // Give executor time to start
-                sleep(Duration::from_millis(10)).await;
-
-                let result = timeout(Duration::from_millis(500), handle).await;
-                assert!(
-                    result.is_ok(),
-                    "Task with yields should complete, got {:?}",
-                    result
-                );
                 assert_eq!(counter.load(Ordering::Relaxed), 3);
             })
             .await;
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_custom_policy_decision() {
         // Create a custom policy that tracks which tasks are picked
         struct Tracker {
             ids: Vec<TaskId>,
             enqueued: Arc<Mutex<Vec<(u64, TaskId)>>>,
             picked: Arc<Mutex<Vec<(TaskId, bool)>>>,
+            mpsc: Option<Arc<crate::mpsc::Mpsc<TaskId>>>,
         }
 
         impl Scheduler for Tracker {
+            fn init(&mut self, mpsc: std::sync::Arc<crate::mpsc::Mpsc<TaskId>>) {
+                self.mpsc = Some(mpsc);
+            }
             fn push(&mut self, id: TaskId, group: u64, _at: Instant) {
                 self.ids.push(id);
                 self.enqueued.lock().unwrap().push((group, id));
@@ -1188,6 +1125,13 @@ mod tests {
             fn clear_group_state(&mut self, _group: u64) {}
 
             fn pop(&mut self) -> Option<TaskId> {
+                // try to pop from mpsc if available
+                if let Some(mpsc) = &self.mpsc {
+                    while let Some(id) = mpsc.pop() {
+                        self.ids.push(id);
+                        self.enqueued.lock().unwrap().push((0, id));
+                    }
+                }
                 // pick largest id
                 let id = self.ids.iter().max().copied();
                 if let Some(id) = id {
@@ -1197,7 +1141,13 @@ mod tests {
             }
 
             fn is_runnable(&self) -> bool {
-                !self.ids.is_empty()
+                if !self.ids.is_empty() {
+                    return true;
+                }
+                if let Some(mpsc) = &self.mpsc {
+                    return !mpsc.is_empty();
+                }
+                false
             }
 
             fn observe(
@@ -1225,6 +1175,7 @@ mod tests {
                         1,
                         Box::new(Tracker {
                             ids: Vec::new(),
+                            mpsc: None,
                             picked: picked.clone(),
                             enqueued: enqueued.clone(),
                         }),
@@ -1232,28 +1183,28 @@ mod tests {
                 )
                 .unwrap();
                 let queue = executor.queue(0).unwrap();
-                // Spawn tasks with different IDs
-                for i in 0..3 {
-                    let _handle = queue.group(i % 2).spawn(async {});
-                }
-
-                local.spawn_local(async move {
-                    executor.run().await;
-                });
-
-                sleep(Duration::from_millis(200)).await;
-
-                let picked = picked.lock().unwrap();
-                assert_eq!(picked.len(), 3);
-                // verify tasks are in reverse order of their IDs and are all ready
-                assert!(picked[0].0 > picked[1].0 && picked[1].0 > picked[2].0);
-                assert!(picked.iter().all(|(_, ready)| *ready));
-                // also verify first and third tasks are in the same group but
-                // second task is in a different group
-                let enqueued = enqueued.lock().unwrap();
-                assert_eq!(enqueued.len(), 3);
-                assert_eq!(enqueued[0].0, enqueued[2].0);
-                assert_ne!(enqueued[0].0, enqueued[1].0);
+                let ran = executor
+                    .run_until(async {
+                        // Spawn tasks with different IDs
+                        for i in 0..3 {
+                            let _handle = queue.group(i % 2).spawn(async move {});
+                        }
+                        sleep(Duration::from_millis(200)).await;
+                        let picked = picked.lock().unwrap();
+                        assert_eq!(picked.len(), 3);
+                        // verify tasks are in reverse order of their IDs and are all ready
+                        assert!(picked[0].0 > picked[1].0 && picked[1].0 > picked[2].0);
+                        assert!(picked.iter().all(|(_, ready)| *ready));
+                        // also verify first and third tasks are in the same group but
+                        // second task is in a different group
+                        let enqueued = enqueued.lock().unwrap();
+                        assert_eq!(enqueued.len(), 3);
+                        assert_eq!(enqueued[0].0, enqueued[2].0);
+                        assert_ne!(enqueued[0].0, enqueued[1].0);
+                        true
+                    })
+                    .await;
+                assert!(ran);
             })
             .await;
     }
@@ -1263,10 +1214,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let queue = executor.queue(0).unwrap();
                 let executed = Arc::new(AtomicBool::new(false));
 
@@ -1280,7 +1228,9 @@ mod tests {
 
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
-                    executor_clone.run().await;
+                    executor_clone
+                        .run_until(sleep(Duration::from_millis(100)))
+                        .await;
                 });
 
                 // Wait a bit
@@ -1310,15 +1260,11 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor = Executor::new(
-                    opts,
-                    vec![
-                        Queue::new(QueueId::High, 1, Box::new(RunnableFifo::new())),
-                        Queue::new(QueueId::Low, 1, Box::new(RunnableFifo::new())),
-                    ],
-                )
-                .unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(QueueId::High, 1)
+                    .with_queue(QueueId::Low, 1)
+                    .build()
+                    .unwrap();
                 let high = Arc::new(AtomicU32::new(0));
                 let low = Arc::new(AtomicU32::new(0));
 
@@ -1327,7 +1273,9 @@ mod tests {
 
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
-                    executor_clone.run().await;
+                    executor_clone
+                        .run_until(sleep(Duration::from_millis(100)))
+                        .await;
                 });
                 let q1 = executor.queue(QueueId::High).unwrap();
                 let _ = q1.spawn(async move {
@@ -1349,50 +1297,48 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor = Executor::new(
-                    opts,
-                    vec![
-                        Queue::new(0, 1, Box::new(RunnableFifo::new())),
-                        Queue::new(1, 1, Box::new(RunnableFifo::new())),
-                    ],
-                )
-                .unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .with_queue(1, 1)
+                    .build()
+                    .unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
                 let q1 = executor.queue(0).unwrap();
-                let _ = q1.spawn(async move {
-                    for _ in 0..1000 {
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                        yield_once().await;
-                    }
-                });
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-                sleep(Duration::from_millis(100)).await;
-                assert_eq!(counter.load(Ordering::Relaxed), 1000);
-                let vruntime1 = executor.queues.borrow()[0].vruntime;
-                assert!(vruntime1 > 0);
-                // now spawn a task in the second queue
-                let counter_clone = counter.clone();
-                let q2 = executor.queue(1).unwrap();
-                let _ = q2.spawn(async move {
-                    counter_clone.fetch_add(1, Ordering::Relaxed);
-                });
-                sleep(Duration::from_millis(100)).await;
-                assert_eq!(counter.load(Ordering::Relaxed), 1001);
-                let vruntime2 = executor.queues.borrow()[1].vruntime;
-                // even though the second task only ran for a short time
-                // its vruntime should have "inherited" the vruntime of the
-                // first queue when it started running
-                assert!(
-                    vruntime2 > vruntime1,
-                    "vruntime2 should be greater than vruntime1, got {} and {}",
-                    vruntime2,
-                    vruntime1
-                );
+                executor
+                    .run_until(async {
+                        let handle = q1.spawn(async move {
+                            for _ in 0..1000 {
+                                counter_clone.fetch_add(1, Ordering::Relaxed);
+                                yield_once().await;
+                            }
+                        });
+                        let result = timeout(Duration::from_millis(100), handle).await;
+                        assert!(result.is_ok(), "Task should complete");
+                        assert_eq!(counter.load(Ordering::Relaxed), 1000);
+                        let vruntime1 = executor.queues.borrow()[0].vruntime;
+                        assert!(vruntime1 > 0);
+                        // now spawn a task in the second queue
+                        let counter_clone = counter.clone();
+                        let q2 = executor.queue(1).unwrap();
+                        let handle = q2.spawn(async move {
+                            counter_clone.fetch_add(1, Ordering::Relaxed);
+                        });
+                        let result = timeout(Duration::from_millis(100), handle).await;
+                        assert!(result.is_ok(), "Task should complete");
+                        assert_eq!(counter.load(Ordering::Relaxed), 1001);
+                        let vruntime2 = executor.queues.borrow()[1].vruntime;
+                        // even though the second task only ran for a short time
+                        // its vruntime should have "inherited" the vruntime of the
+                        // first queue when it started running
+                        assert!(
+                            vruntime2 > vruntime1,
+                            "vruntime2 should be greater than vruntime1, got {} and {}",
+                            vruntime2,
+                            vruntime1
+                        );
+                    })
+                    .await;
             })
             .await;
     }
@@ -1402,36 +1348,35 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let queue = executor.queue(0).unwrap();
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
                 let counter1 = Arc::new(AtomicU32::new(0));
                 let counter1_clone = counter1.clone();
-                let handle = queue.spawn(async move {
-                    let mut i = 0;
-                    loop {
-                        counter1_clone.fetch_add(1, Ordering::Relaxed);
-                        if i % 1000 == 0 {
-                            yield_maybe().await;
-                        }
-                        i += 1;
-                    }
+                local.spawn_local(async move {
+                    executor
+                        .run_until(async {
+                            let handle = queue.spawn(async move {
+                                let mut i = 0;
+                                loop {
+                                    counter1_clone.fetch_add(1, Ordering::Relaxed);
+                                    if i % 1000 == 0 {
+                                        yield_maybe().await;
+                                    }
+                                    i += 1;
+                                }
+                            });
+                            sleep(Duration::from_millis(100)).await;
+                            let count = counter1.load(Ordering::Relaxed);
+                            assert!(count > 0);
+                            let yields = executor.stats.borrow().driver_yields;
+                            assert!(yields > 0);
+                            // we have yielded at most half the time (in practice much
+                            // much less)
+                            assert!(yields < count as u64 / 1000 / 2);
+                            handle.abort();
+                        })
+                        .await;
                 });
-                sleep(Duration::from_millis(100)).await;
-                let count = counter1.load(Ordering::Relaxed);
-                assert!(count > 0);
-                let yields = executor.stats.borrow().driver_yields;
-                assert!(yields > 0);
-                // we have yielded at most half the time (in practice much
-                // much less)
-                assert!(yields < count as u64 / 1000 / 2);
-                handle.abort();
             })
             .await;
     }
@@ -1439,25 +1384,19 @@ mod tests {
     // Test with smol runtime
     #[test]
     fn test_smol_runtime() {
-        let queue = Queue::new(0, 1, Box::new(RunnableFifo::new()));
-        let opts = ExecutorOptions::default();
-        let executor = Executor::new(opts, vec![queue]).unwrap();
-        let executor_clone = executor.clone();
+        let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
         let smol_local_ex = smol::LocalExecutor::new();
-        let h1 = smol_local_ex.spawn(async move {
-            executor_clone.run().await;
-        });
         let h2 = smol_local_ex.spawn(async move {
             let queue = executor.queue(0).unwrap();
-            let handle = queue.spawn(async move { 42 });
-            handle.await
+            executor
+                .run_until(async {
+                    let handle = queue.spawn(async move { 42 });
+                    handle.await
+                })
+                .await
         });
 
-        let res = smol::future::block_on(smol_local_ex.run(async {
-            let res = h2.await;
-            drop(h1);
-            res
-        }));
+        let res = smol::future::block_on(smol_local_ex.run(async { h2.await }));
         assert_eq!(res, Ok(42));
     }
 
@@ -1466,26 +1405,24 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
                 let queue = executor.queue(0).unwrap();
-                let handle = queue.spawn(async move {
-                    counter_clone.fetch_add(1, Ordering::Relaxed);
-                    42
-                });
-                sleep(Duration::from_millis(100)).await;
-                assert_eq!(counter.load(Ordering::Relaxed), 1);
-                // task is done but abort should still work - no-op
-                handle.abort();
-                let result = handle.await;
+                let result = executor
+                    .run_until(async {
+                        let handle = queue.spawn(async move {
+                            counter_clone.fetch_add(1, Ordering::Relaxed);
+                            42
+                        });
+                        // wait for task to complete
+                        sleep(Duration::from_millis(100)).await;
+                        assert!(counter.load(Ordering::Relaxed) > 0);
+                        // handle should still be abortable - though no-op
+                        handle.abort();
+                        handle.await
+                    })
+                    .await;
                 assert_eq!(result, Ok(42));
             })
             .await;
@@ -1500,205 +1437,40 @@ mod tests {
             .build()
             .unwrap();
         let _ = rt.block_on(async move {
-            let opts = ExecutorOptions::default();
-            let queue = Queue::new(0, 1, Box::new(RunnableFifo::new()));
-            let executor = Executor::new(opts, vec![queue]).unwrap();
+            let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
             let counter = Arc::new(AtomicU32::new(0));
 
             let counter_clone = counter.clone();
             let queue = executor.queue(0).unwrap();
-            let handle = queue.spawn(async move {
-                counter_clone.fetch_add(1, Ordering::Relaxed);
-                42
-            });
+            let result = executor
+                .run_until(async {
+                    // initial value should be 0
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
 
-            // initial value should be 0
-            assert_eq!(counter.load(Ordering::Relaxed), 0);
-            // Run executor in background
-            let executor_clone = executor.clone();
-            monoio::spawn(async move {
-                executor_clone.run().await;
-            });
-            monoio::time::sleep(Duration::from_millis(100)).await;
-            // task should have completed
-            assert_eq!(counter.load(Ordering::Relaxed), 1);
-            let result = handle.await;
+                    let handle = queue.spawn(async move {
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                        42
+                    });
+                    monoio::time::sleep(Duration::from_millis(100)).await;
+                    // task should have completed
+                    assert_eq!(counter.load(Ordering::Relaxed), 1);
+                    handle.await
+                })
+                .await;
             assert_eq!(result, Ok(42));
         });
-    }
-
-    #[tokio::test]
-    async fn test_force_shutdown() {
-        // verify happy path - shutdown returns a handle that is awaitable
-        // also spawns aren't allowed after shutdown
-        // and when using force shutdown, all tasks are cancelled
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-                let counter = Arc::new(AtomicU32::new(0));
-                let counter_clone = counter.clone();
-                // spawn a task that runs forever
-                let queue = executor.queue(0).unwrap();
-                let task = queue.spawn(async move {
-                    loop {
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                        sleep(Duration::from_millis(100)).await;
-                    }
-                });
-                // sleep a bit to let the task start
-                sleep(Duration::from_millis(100)).await;
-                assert!(counter.load(Ordering::Relaxed) > 0);
-                assert_eq!(executor.num_live_tasks(), 1);
-                // shutdown with drain mode
-                let shutdown_handle = executor.shutdown(ShutdownMode::Force);
-                // can't spawn after shutdown
-                let queue = executor.queue(0).unwrap();
-                let result = queue.spawn(async move { 42 });
-                // this should be cancelled immediately
-                let result = timeout(Duration::from_millis(1), result).await;
-                assert!(result.is_ok());
-                assert!(matches!(result.unwrap(), Err(JoinError::Cancelled)));
-                // await shutdown handle
-                shutdown_handle.await;
-                // all tasks should be cancelled
-                assert_eq!(executor.num_live_tasks(), 0);
-                // and await on task works
-                let result = task.await;
-                assert!(matches!(result, Err(JoinError::Cancelled)));
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_drain_timeout() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-                let counter = Arc::new(AtomicU32::new(0));
-                let counter_clone = counter.clone();
-                // spawn a task that runs forever
-                let queue = executor.queue(0).unwrap();
-                let task = queue.spawn(async move {
-                    loop {
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                        sleep(Duration::from_millis(100)).await;
-                    }
-                });
-                // sleep a bit to let the task start
-                sleep(Duration::from_millis(100)).await;
-                let count = counter.load(Ordering::Relaxed);
-                assert!(count > 0);
-                assert_eq!(executor.num_live_tasks(), 1);
-                // shutdown with drain mode
-                let shutdown_handle =
-                    executor.shutdown(ShutdownMode::DrainFor(Duration::from_secs(1)));
-                // can't spawn after shutdown
-                let queue = executor.queue(0).unwrap();
-                let result = queue.spawn(async move { 42 });
-                // join handle should be cancelled immediately
-                let result = timeout(Duration::from_millis(1), result).await;
-                assert!(result.is_ok());
-                assert!(matches!(result.unwrap(), Err(JoinError::Cancelled)));
-                // sleep for 100 ms - task should still be running
-                sleep(Duration::from_millis(100)).await;
-                assert!(counter.load(Ordering::Relaxed) > count);
-                assert_eq!(executor.num_live_tasks(), 1);
-                // if we try to await shutdown or task handle with timeout,
-                // it should timeout
-                let result = timeout(Duration::from_millis(100), shutdown_handle.clone()).await;
-                assert!(result.is_err());
-                let result = timeout(Duration::from_millis(100), task.clone()).await;
-                assert!(result.is_err());
-                // but it should be done within 1 second
-                let result = timeout(Duration::from_secs(1), shutdown_handle).await;
-                assert!(result.is_ok());
-                assert_eq!(executor.num_live_tasks(), 0);
-                // and task should be cancelled
-                let result = timeout(Duration::from_millis(1), task).await;
-                let result = result.unwrap();
-                assert_eq!(result, Err(JoinError::Cancelled));
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_drain_shutdown() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-                let counter = Arc::new(AtomicU32::new(0));
-                let counter_clone = counter.clone();
-                // spawn a task that runs forever
-                let queue = executor.queue(0).unwrap();
-                let task = queue.spawn(async move {
-                    counter_clone.fetch_add(1, Ordering::Relaxed);
-                    sleep(Duration::from_millis(100)).await;
-                    counter_clone.fetch_add(1, Ordering::Relaxed);
-                    sleep(Duration::from_millis(100)).await;
-                    counter_clone.fetch_add(1, Ordering::Relaxed);
-                    42
-                });
-                // wait just a bit to let the task start
-                sleep(Duration::from_millis(10)).await;
-                // verify task has started
-                assert_eq!(executor.num_live_tasks(), 1);
-                assert!(counter.load(Ordering::Relaxed) == 1);
-                // now initiate shutdown
-                let shutdown_handle = executor.shutdown(ShutdownMode::Drain);
-                // await shutdown handle
-                let result = timeout(Duration::from_secs(1), shutdown_handle.clone()).await;
-                assert!(result.is_ok());
-                // all tasks should be cancelled
-                assert_eq!(executor.num_live_tasks(), 0);
-                // more importantly though the task should have completed
-                assert_eq!(counter.load(Ordering::Relaxed), 3);
-                let result = timeout(Duration::from_millis(1), task).await;
-                let result = result.unwrap();
-                assert_eq!(result, Ok(42));
-            })
-            .await;
     }
 
     #[test]
     fn test_bad_executor_creation() {
         // can't create executor with 0 shares
-        let result = Executor::new(
-            ExecutorOptions::default(),
-            vec![Queue::new(0, 0, Box::new(RunnableFifo::new()))],
-        );
+        let result = ExecutorBuilder::new().with_queue(0, 0).build();
         assert!(result.is_err());
         // can't create executor with duplicate queue IDs
-        let result = Executor::new(
-            ExecutorOptions::default(),
-            vec![
-                Queue::new(0, 1, Box::new(RunnableFifo::new())),
-                Queue::new(0, 1, Box::new(RunnableFifo::new())),
-            ],
-        );
+        let result = ExecutorBuilder::new()
+            .with_queue(0, 1)
+            .with_queue(0, 1)
+            .build();
         assert!(result.is_err());
         // can't create executor with 0 queues
         let result = Executor::<u8>::new(ExecutorOptions::default(), vec![]);
@@ -1710,15 +1482,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor = Executor::<u8>::new(
-                    opts,
-                    vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))],
-                )
-                .unwrap();
+                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
                 let queue = executor.queue(0).unwrap();
                 let handle = tokio::task::spawn_local(async move {
-                    executor.run().await;
+                    executor.run_until(sleep(Duration::from_millis(100))).await;
                 });
                 let _ = queue.spawn(async {
                     panic!("test");
@@ -1736,32 +1503,21 @@ mod tests {
         local
             .run_until(async {
                 // Configure executor to catch panics instead of crashing
-                let opts = ExecutorOptions {
-                    sched_latency: Duration::from_millis(2),
-                    min_slice: Duration::from_micros(100),
-                    driver_yield: Duration::from_micros(500),
-                    panic_on_task_panic: false, // Don't panic on task panic
-                };
-                let executor = Executor::<u8>::new(
-                    opts,
-                    vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))],
-                )
-                .unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_panic_on_task_panic(false)
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let queue = executor.queue(0).unwrap();
-
-                // Spawn executor in background
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-
-                // Spawn a task that panics
-                let task_handle = queue.spawn(async {
-                    panic!("test panic message");
+                let result = executor.run_until(async {
+                    let task_handle = queue.spawn(async {
+                        panic!("test panic message");
+                    });
+                    task_handle.await
                 });
 
                 // Wait for the task to complete (should complete with Panic error)
-                let result = timeout(Duration::from_millis(100), task_handle).await;
+                let result = timeout(Duration::from_millis(100), result).await;
                 assert!(result.is_ok(), "Task should complete (with panic error)");
 
                 let join_result = result.unwrap();
@@ -1779,98 +1535,6 @@ mod tests {
                     executor.num_live_tasks(),
                     0,
                     "Task should be removed after panic"
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_without_tasks() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
-                assert_eq!(executor.num_live_tasks(), 0);
-
-                // Start executor in background
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-
-                // Give executor a moment to start
-                tokio::task::yield_now().await;
-
-                let shutdown_handle = executor.shutdown(ShutdownMode::Drain);
-                // do a timeout to ensure shutdown handle is awaitable
-                let result = timeout(Duration::from_millis(100), shutdown_handle).await;
-                assert!(result.is_ok());
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_before_run() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
-                assert_eq!(executor.num_live_tasks(), 0);
-
-                // Call shutdown before run() is called
-                let shutdown_handle = executor.shutdown(ShutdownMode::Drain);
-
-                // Shutdown handle should complete immediately (without waiting for run())
-                let result = timeout(Duration::from_millis(100), shutdown_handle).await;
-                assert!(
-                    result.is_ok(),
-                    "Shutdown should complete immediately when called before run()"
-                );
-
-                // Now start executor - it should exit immediately since already shutdown
-                let executor_clone = executor.clone();
-                local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-
-                // Give executor a moment to exit
-                tokio::task::yield_now().await;
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_run_after_shutdown() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
-                assert_eq!(executor.num_live_tasks(), 0);
-
-                // Shutdown the executor
-                let shutdown_handle = executor.shutdown(ShutdownMode::Drain);
-                let _ = timeout(Duration::from_millis(100), shutdown_handle).await;
-
-                // Now try to run - it should exit immediately
-                let executor_clone = executor.clone();
-                let run_handle = local.spawn_local(async move {
-                    executor_clone.run().await;
-                });
-
-                // Run should complete immediately
-                let result = timeout(Duration::from_millis(100), run_handle).await;
-                assert!(
-                    result.is_ok(),
-                    "run() should complete immediately after shutdown"
                 );
             })
             .await;

@@ -1,9 +1,18 @@
+use rand::{rngs::StdRng, Rng};
 use smol::future::FutureExt;
 use std::{
-    ops::{Deref, DerefMut},
+    ops::DerefMut,
     task::Poll,
     time::{Duration, Instant},
 };
+
+// Shared across both runtimes
+static CORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn do_cpu_work_serialized(duration: Duration) {
+    let _guard = CORE_LOCK.lock().unwrap();
+    do_cpu_work(duration);
+}
 
 // ============================================================================
 // Work Task
@@ -28,24 +37,23 @@ impl Work {
     pub async fn run(&self) {
         for step in self.steps.iter() {
             match step {
-                Step::CPU(duration) => Self::do_cpu_work(*duration),
+                Step::CPU(duration) => do_cpu_work_serialized(*duration),
                 Step::Sleep(duration) => tokio::time::sleep(*duration).await,
                 Step::Yield => tokio::task::yield_now().await,
             }
         }
     }
+}
 
-    /// Do approximately `duration` of CPU work
-    #[inline(never)]
-    fn do_cpu_work(duration: Duration) {
-        let start = Instant::now();
-        let mut acc: u64 = 0;
-        while start.elapsed() < duration {
-            for _ in 0..1000 {
-                acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
-            }
-            std::hint::black_box(acc);
+/// Do approximately `duration` of CPU work
+pub fn do_cpu_work(duration: Duration) {
+    let start = Instant::now();
+    let mut acc: u64 = 0;
+    while start.elapsed() < duration {
+        for _ in 0..1000 {
+            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
         }
+        std::hint::black_box(acc);
     }
 }
 
@@ -92,10 +100,11 @@ impl Metrics {
         self.iters.len() as u64
     }
     pub fn mean(&self, tag: &str) -> Duration {
+        let tag = tag.to_string();
         let mut sum = Duration::ZERO;
         let mut count = 0;
         for p in self.iters.iter() {
-            if p.tags.contains(&tag.to_string()) {
+            if p.tags.contains(&tag) {
                 sum += p.duration;
                 count += 1;
             }
@@ -161,25 +170,6 @@ impl<T> std::future::Future for Handle<T> {
 }
 
 impl Executor {
-    pub async fn start_tokio(local: tokio::task::LocalSet) -> Self {
-        Self::Tokio {
-            local: std::rc::Rc::new(local),
-        }
-    }
-
-    pub async fn start_clockworker(
-        executor: std::rc::Rc<clockworker::Executor<u8>>,
-        local: tokio::task::LocalSet,
-    ) -> Self {
-        let executor_clone = executor.clone();
-        local.spawn_local(async move {
-            executor_clone.run().await;
-        });
-        Self::Clockworker {
-            executor,
-            local: std::rc::Rc::new(local),
-        }
-    }
     pub fn spawn<T: 'static>(
         &self,
         fut: impl std::future::Future<Output = T> + 'static,
@@ -194,8 +184,29 @@ impl Executor {
     }
     pub async fn run_until<T>(&self, fut: impl std::future::Future<Output = T> + 'static) -> T {
         match self.clone() {
-            Executor::Clockworker { local, .. } => local.run_until(fut).await,
+            Executor::Clockworker { executor, local } => {
+                let executor_clone = executor.clone();
+                local
+                    .run_until(async move { executor_clone.run_until(fut).await })
+                    .await
+            }
             Executor::Tokio { local } => local.run_until(fut).await,
+        }
+    }
+
+    pub async fn start_clockworker(
+        executor: std::rc::Rc<clockworker::Executor<u8>>,
+        local: tokio::task::LocalSet,
+    ) -> Self {
+        Executor::Clockworker {
+            executor,
+            local: std::rc::Rc::new(local),
+        }
+    }
+
+    pub async fn start_tokio(local: tokio::task::LocalSet) -> Self {
+        Executor::Tokio {
+            local: std::rc::Rc::new(local),
         }
     }
 }
@@ -209,4 +220,27 @@ pub fn exponential_delay(rng: &mut impl rand::Rng, mean: Duration) -> Duration {
     let u = u.max(f64::EPSILON);
     let multiplier = -u.ln();
     Duration::from_secs_f64(mean.as_secs_f64() * multiplier)
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkSpec {
+    pub cpu_min: Duration,
+    pub cpu_max: Duration,
+    pub io_min: Duration,
+    pub io_max: Duration,
+    pub num_yields_min: usize,
+    pub num_yields_max: usize,
+}
+impl WorkSpec {
+    pub fn sample(&self, rng: &mut StdRng) -> Work {
+        let mut steps = Vec::new();
+        let num_yields = rng.gen_range(self.num_yields_min..self.num_yields_max);
+        for _ in 0..num_yields {
+            let cpu = rng.gen_range(self.cpu_min..=self.cpu_max);
+            let io = rng.gen_range(self.io_min..=self.io_max);
+            steps.push(Step::CPU(cpu));
+            steps.push(Step::Sleep(io));
+        }
+        Work::new(steps)
+    }
 }

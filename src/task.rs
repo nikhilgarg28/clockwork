@@ -1,5 +1,5 @@
+use crate::mpsc::Mpsc;
 use crate::queue::{QueueKey, TaskId};
-use flume::Sender;
 use futures::task::ArcWake;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,11 +21,11 @@ pub struct TaskHeader<K: QueueKey> {
     // changes to true when task is cancelled
     // this is the ground truth for cancellation, not join state
     cancelled: AtomicBool,
-    ingress_tx: Sender<TaskId>,
+    ingress_tx: Arc<Mpsc<TaskId>>,
 }
 
 impl<K: QueueKey> TaskHeader<K> {
-    pub fn new(id: TaskId, qid: K, group: u64, ingress_tx: Sender<TaskId>) -> Self {
+    pub fn new(id: TaskId, qid: K, group: u64, ingress_tx: Arc<Mpsc<TaskId>>) -> Self {
         Self {
             id,
             qid,
@@ -39,6 +39,7 @@ impl<K: QueueKey> TaskHeader<K> {
     pub fn qid(&self) -> K {
         self.qid
     }
+    #[inline]
     pub fn enqueue(&self) {
         if self.is_done() || self.is_cancelled() {
             return;
@@ -47,21 +48,24 @@ impl<K: QueueKey> TaskHeader<K> {
         if !self.queued.swap(true, Ordering::AcqRel) {
             // Unbounded send should not block.
             // If receiver is dropped, ignore.
-            let _ = self.ingress_tx.send(self.id);
+            let _ = self.ingress_tx.enqueue(self.id);
         }
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
+    #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
+    #[inline]
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Acquire)
     }
     pub fn set_done(&self) {
         self.done.store(true, Ordering::Release);
     }
+    #[inline]
     pub fn set_queued(&self, queued: bool) {
         self.queued.store(queued, Ordering::Release);
     }
@@ -71,6 +75,7 @@ impl<K: QueueKey> TaskHeader<K> {
 }
 
 impl<K: QueueKey> ArcWake for TaskHeader<K> {
+    #[inline]
     fn wake_by_ref(arc_self: &Arc<Self>) {
         arc_self.enqueue();
     }

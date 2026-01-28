@@ -1,9 +1,20 @@
 # Clockworker Benchmarks
 
+## ExecutorBuilder API
+
+The executor builder provides two methods for adding queues:
+
+- `with_queue(qid, share)` - Creates a queue with the default RunnableFifo scheduler
+- `with_queue_scheduler(qid, share, scheduler)` - Creates a queue with a custom scheduler
+
+For most use cases, `with_queue()` is sufficient. Use `with_queue_scheduler()` when you need a specific scheduling algorithm (e.g., LAS, QLAS, QSRPT, FairSRPT).
+
 ## Running the Benchmarks
 
 ```bash
 cargo bench --bench overhead
+cargo bench --bench tail_latency
+cargo bench --bench poll_profile
 ```
 
 Results are printed to stdout and also saved to `benchmark_results.csv` for further analysis.
@@ -41,11 +52,11 @@ Results are printed to stdout and also saved to `benchmark_results.csv` for furt
 
 **Comparison**: 
 - Tokio (baseline)
-- Clockworker with RunnableFifo (simple FIFO, O(1) operations)
+- Clockworker with default FIFO scheduler (simple FIFO, O(1) operations)
 - Clockworker with LAS (Least Attained Service, O(log n) operations)
 
 **What to look for**:
-- RunnableFifo should be close to Tokio
+- Default FIFO scheduler should be close to Tokio
 - LAS will be slower (BTreeMap operations) - but how much?
 - If LAS is 10x slower, that's a concern
 
@@ -106,3 +117,98 @@ If you find high overhead:
 3. **Reactor starvation (1C)**:
    - Increase `driver_yield` duration
    - Check if `yield_maybe` is being called frequently enough in long-running tasks
+
+## Poll Profile Benchmark
+
+**Goal**: Profile the executor's poll path to identify performance bottlenecks.
+
+**Setup**:
+- Spawn N tasks (default: 10,000)
+- Each task yields K times (default: 100)
+- Minimal work - focuses on poll overhead
+
+**Usage**:
+
+```bash
+# Run normally (just timing)
+cargo bench --bench poll_profile
+
+# Run with flamegraph (requires cargo-flamegraph: cargo install flamegraph)
+cargo flamegraph --bench poll_profile
+# Output: flamegraph.svg
+
+# Run with pprof (generates flamegraph.svg and profile.pb)
+# Note: On macOS, this may require running with sudo or may fail with SIGTRAP
+# If it fails, use cargo-flamegraph instead (recommended)
+PROFILE=pprof cargo bench --bench poll_profile
+```
+
+**Configuration via environment variables**:
+- `N_TASKS`: Number of tasks to spawn (default: 10000)
+- `YIELDS_PER_TASK`: Number of yields per task (default: 100)
+- `EXECUTOR`: "clockworker" or "tokio" (default: "clockworker")
+- `SCHEDULER`: "fifo", "las", or "qlas" (default: "fifo", only for clockworker)
+- `PROFILE`: Set to "pprof" to enable pprof profiling
+
+**Examples**:
+
+```bash
+# Profile Clockworker with LAS scheduler
+SCHEDULER=las cargo bench --bench poll_profile
+
+# Profile with more tasks/yields
+N_TASKS=50000 YIELDS_PER_TASK=200 cargo bench --bench poll_profile
+
+# Compare with Tokio
+EXECUTOR=tokio cargo bench --bench poll_profile
+
+# Generate pprof flamegraph
+PROFILE=pprof SCHEDULER=las cargo bench --bench poll_profile
+```
+
+**Interpreting Results**:
+
+1. **Flamegraph**: Shows call stack and time spent in each function
+   - Look for hot paths in `poll_task`, `pop_next_task_from_queue`, scheduler operations
+   - Identify RefCell borrow overhead, stats recording, `Instant::now()` calls, etc.
+   - Open `flamegraph.svg` in a web browser to explore
+
+2. **pprof**: Use `go tool pprof` or `pprof` command to analyze
+   ```bash
+   go tool pprof profile.pb
+   # Or with web UI:
+   pprof -http=:8080 profile.pb
+   ```
+   **Note**: On macOS, pprof may fail with SIGTRAP due to system-level profiling restrictions.
+   If this happens, use `cargo flamegraph` instead (recommended for macOS).
+
+3. **Timing output**: Shows total time, polls/sec, and avg time per poll
+   - Compare different schedulers to see overhead differences
+   - Use to validate optimizations
+
+**Troubleshooting pprof on macOS**:
+
+If you get `SIGTRAP` errors when using pprof, pprof requires system-level profiling permissions. Options:
+
+1. **Run with sudo** (enables signal-based profiling):
+   ```bash
+   sudo PROFILE=pprof cargo bench --bench poll_profile
+   ```
+   Note: This requires root access and may prompt for your password.
+
+2. **Use cargo-flamegraph** (recommended, no sudo needed):
+   ```bash
+   cargo flamegraph --bench poll_profile
+   ```
+   This uses `perf` on Linux or `dtrace` on macOS with proper permissions.
+
+3. **Use Instruments** (macOS native profiler):
+   ```bash
+   xcrun xctrace record --template 'Time Profiler' \\
+     --launch -- cargo bench --bench poll_profile
+   ```
+   Then open the trace in Instruments.app.
+
+4. **Run in Linux container/VM**: pprof works reliably on Linux without special permissions.
+
+The benchmark will gracefully handle pprof failures and suggest these alternatives.

@@ -3,31 +3,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 use tabled::Table;
 mod utils;
-use utils::{Executor, Metrics, Step, Work};
-
-#[derive(Clone, Debug)]
-pub struct WorkSpec {
-    cpu_min: Duration,
-    cpu_max: Duration,
-    io_min: Duration,
-    io_max: Duration,
-    num_yields_min: usize,
-    num_yields_max: usize,
-}
-impl WorkSpec {
-    pub fn sample(&self) -> Work {
-        let mut steps = Vec::new();
-        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-        let num_yields = rng.gen_range(self.num_yields_min..=self.num_yields_max);
-        for _ in 0..num_yields {
-            let cpu = rng.gen_range(self.cpu_min..=self.cpu_max);
-            let io = rng.gen_range(self.io_min..=self.io_max);
-            steps.push(Step::CPU(cpu));
-            steps.push(Step::Sleep(io));
-        }
-        Work::new(steps)
-    }
-}
+use utils::{Executor, Metrics, Work, WorkSpec};
 
 #[derive(Clone)]
 pub struct BenchmarkSpec {
@@ -43,30 +19,30 @@ impl BenchmarkSpec {
     fn expected_cpu_work_percent(&self) -> f64 {
         let exp_num_thin_tasks =
             self.n as f64 * self.ratio_thin as f64 / (self.ratio_thin + self.ratio_fat) as f64;
-        let exp_num_yields_per_thin = self.thin_spec.num_yields_min
-            + ((self.thin_spec.num_yields_max - self.thin_spec.num_yields_min) as f64 / 2.0)
-                as usize;
-        let exp_cpu_work_per_thin_yield_ns = {
+        let exp_num_yields_per_thin = self.thin_spec.num_yields_min as f64
+            + ((self.thin_spec.num_yields_max - self.thin_spec.num_yields_min) as f64 / 2.0);
+        let exp_cpu_work_per_thin_task = {
             let min_nanos = self.thin_spec.cpu_min.as_nanos() as f64;
             let max_nanos = self.thin_spec.cpu_max.as_nanos() as f64;
             let avg_nanos = (min_nanos + max_nanos) / 2.0;
             avg_nanos * exp_num_yields_per_thin as f64
         };
-        let exp_num_yields_per_fat = self.fat_spec.num_yields_min
-            + ((self.fat_spec.num_yields_max - self.fat_spec.num_yields_min) as f64 / 2.0) as usize;
-        let exp_cpu_work_per_fat_yield_ns = {
+        let exp_num_yields_per_fat = self.fat_spec.num_yields_min as f64
+            + ((self.fat_spec.num_yields_max - self.fat_spec.num_yields_min) as f64 / 2.0);
+        let exp_cpu_work_per_fat_task = {
             let min_nanos = self.fat_spec.cpu_min.as_nanos() as f64;
             let max_nanos = self.fat_spec.cpu_max.as_nanos() as f64;
             let avg_nanos = (min_nanos + max_nanos) / 2.0;
             avg_nanos * exp_num_yields_per_fat as f64
         };
-        let total_thin_cpu_work_ns = exp_cpu_work_per_thin_yield_ns * exp_num_thin_tasks;
+        let total_thin_cpu_work_ns = exp_cpu_work_per_thin_task * exp_num_thin_tasks;
         let total_fat_cpu_work_ns =
-            exp_cpu_work_per_fat_yield_ns * (self.n as f64 - exp_num_thin_tasks);
+            exp_cpu_work_per_fat_task * (self.n as f64 - exp_num_thin_tasks);
         let total_cpu_work_ns = total_thin_cpu_work_ns + total_fat_cpu_work_ns;
         let expected_duration_secs = self.n as f64 / self.rps as f64;
         let total_cpu_available_ns = expected_duration_secs * 1_000_000_000.0;
-        total_cpu_work_ns / total_cpu_available_ns
+        let expected_cpu_work_percent = total_cpu_work_ns / total_cpu_available_ns;
+        expected_cpu_work_percent
     }
 }
 
@@ -118,19 +94,12 @@ fn generate(
     let period = Duration::from_nanos(1_000_000_000u64 / rps as u64);
 
     for _ in 0..n {
-        let start = Instant::now();
         let delay = utils::exponential_delay(&mut rng, period);
-        while start.elapsed() < delay {
-            let mut acc: u64 = 0;
-            for _ in 0..1000 {
-                acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
-            }
-            std::hint::black_box(acc);
-        }
+        utils::do_cpu_work(delay);
         let (thin, work) = if rng.gen_ratio(ratio_thin, ratio_thin + ratio_fat) {
-            (true, thin.sample())
+            (true, thin.sample(&mut rng))
         } else {
-            (false, fat.sample())
+            (false, fat.sample(&mut rng))
         };
         tx.send(Task {
             thin,
@@ -205,7 +174,7 @@ fn main() {
             io_min: Duration::from_micros(100),
             io_max: Duration::from_micros(1000),
             num_yields_min: 0,
-            num_yields_max: 3,
+            num_yields_max: 5,
         },
         fat_spec: WorkSpec {
             cpu_min: Duration::from_micros(100),
@@ -216,9 +185,9 @@ fn main() {
             num_yields_max: 10,
         },
         // 90% thin tasks, 10% fat tasks
-        ratio_thin: 90,
-        ratio_fat: 10,
-        rps: 1200,
+        ratio_thin: 99,
+        ratio_fat: 1,
+        rps: 1000,
     };
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║          Clockworker Tail Latency Benchmark                  ║");
@@ -241,10 +210,11 @@ fn main() {
     let start = Instant::now();
     let tokio_metrics = benchmark_tokio(spec.clone());
     println!(" done in {:?}", start.elapsed());
+
     print!("Running clockworker benchmark(LAS)...");
     std::io::stdout().flush().unwrap();
     let executor = clockworker::ExecutorBuilder::new()
-        .with_queue(0u8, 1, clockworker::scheduler::LAS::new())
+        .with_queue_scheduler(0u8, 1, clockworker::scheduler::LAS::new())
         .build()
         .unwrap();
     let start = Instant::now();
@@ -252,7 +222,7 @@ fn main() {
     println!(" done in {:?}", start.elapsed());
     print!("Running clockworker benchmark(Runnable FIFO)...");
     let executor = clockworker::ExecutorBuilder::new()
-        .with_queue(0u8, 1, clockworker::scheduler::RunnableFifo::new())
+        .with_queue(0u8, 1)
         .build()
         .unwrap();
     std::io::stdout().flush().unwrap();
@@ -262,7 +232,7 @@ fn main() {
 
     print!("Running clockworker benchmark(QLAS)...");
     let executor = clockworker::ExecutorBuilder::new()
-        .with_queue(0u8, 1, clockworker::scheduler::QLAS::new())
+        .with_queue_scheduler(0u8, 1, clockworker::scheduler::QLAS::new())
         .build()
         .unwrap();
     std::io::stdout().flush().unwrap();
@@ -270,11 +240,33 @@ fn main() {
     let clockworker_qlas_metrics = benchmark_clockworker(executor, spec.clone());
     println!(" done in {:?}", start.elapsed());
 
+    print!("Running clockworker benchmark(QSRPT)...");
+    let executor = clockworker::ExecutorBuilder::new()
+        .with_queue_scheduler(0u8, 1, clockworker::scheduler::QSRPT::new())
+        .build()
+        .unwrap();
+    std::io::stdout().flush().unwrap();
+    let start = Instant::now();
+    let clockworker_qsrpt_metrics = benchmark_clockworker(executor, spec.clone());
+    println!(" done in {:?}", start.elapsed());
+
+    print!("Running clockworker benchmark(FairSRPT)...");
+    let executor = clockworker::ExecutorBuilder::new()
+        .with_queue_scheduler(0u8, 1, clockworker::scheduler::FairSRPT::new())
+        .build()
+        .unwrap();
+    std::io::stdout().flush().unwrap();
+    let start = Instant::now();
+    let clockworker_fairsrpt_metrics = benchmark_clockworker(executor, spec.clone());
+    println!(" done in {:?}", start.elapsed());
+
     let results = vec![
         ("Tokio", tokio_metrics),
         ("Clockworker(LAS)", clockworker_las_metrics),
         ("Clockworker(Runnable FIFO)", clockworker_fifo_metrics),
         ("Clockworker(QLAS)", clockworker_qlas_metrics),
+        ("Clockworker(QSRPT)", clockworker_qsrpt_metrics),
+        ("Clockworker(FairSRPT)", clockworker_fairsrpt_metrics),
     ];
     print_results(&results);
 }
@@ -290,68 +282,74 @@ fn print_results(results: &[(&str, Metrics)]) {
     #[derive(tabled::Tabled)]
     struct LatencyTable {
         name: String,
-        p5_thin_ms: String,
-        p25_thin_ms: String,
-        p50_thin_ms: String,
-        p90_thin_ms: String,
-        p99_thin_ms: String,
-        p5_fat_ms: String,
-        p25_fat_ms: String,
-        p50_fat_ms: String,
-        p90_fat_ms: String,
-        p99_fat_ms: String,
-        mean_admit_delay_ms: String,
-        mean_start_delay_ms: String,
-        mean_execution_time_ms: String,
+        p5_thin_us: String,
+        p50_thin_us: String,
+        p90_thin_us: String,
+        p99_thin_us: String,
+        mean_thin_us: String,
+        p5_fat_us: String,
+        p50_fat_us: String,
+        p90_fat_us: String,
+        p99_fat_us: String,
+        mean_fat_us: String,
+        mean_admit_delay_us: String,
+        mean_start_delay_us: String,
+        p50_execution_time_us: String,
+        p90_execution_time_us: String,
+        p99_execution_time_us: String,
+        mean_execution_time_us: String,
     }
 
     let mut rows = Vec::new();
     for (name, metrics) in results {
         let format_value = |quantile: f64, tag: &str| -> String {
-            let value_ms = metrics.quantile(quantile, tag).as_millis() as f64;
+            let value_us = metrics.quantile(quantile, tag).as_micros() as f64;
             if name == &"Tokio" {
-                format!("{:.2}", value_ms)
+                format!("{:.2}", value_us)
             } else {
-                let baseline_ms = tokio_metrics.quantile(quantile, tag).as_millis() as f64;
-                let pct_change = if baseline_ms > 0.0 {
-                    ((value_ms - baseline_ms) / baseline_ms) * 100.0
+                let baseline_us = tokio_metrics.quantile(quantile, tag).as_micros() as f64;
+                let pct_change = if baseline_us > 0.0 {
+                    ((value_us - baseline_us) / baseline_us) * 100.0
                 } else {
                     0.0
                 };
-                format!("{:.2} ({:+.1}%)", value_ms, pct_change)
+                format!("{:.2} ({:+.1}%)", value_us, pct_change)
             }
         };
 
         let format_mean = |tag: &str| -> String {
-            let value_ms = metrics.mean(tag).as_millis() as f64;
+            let value_us = metrics.mean(tag).as_micros() as f64;
             if name == &"Tokio" {
-                format!("{:.2}", value_ms)
+                format!("{:.2}", value_us)
             } else {
-                let baseline_ms = tokio_metrics.mean(tag).as_millis() as f64;
-                let pct_change = if baseline_ms > 0.0 {
-                    ((value_ms - baseline_ms) / baseline_ms) * 100.0
+                let baseline_us = tokio_metrics.mean(tag).as_micros() as f64;
+                let pct_change = if baseline_us > 0.0 {
+                    ((value_us - baseline_us) / baseline_us) * 100.0
                 } else {
                     0.0
                 };
-                format!("{:.2} ({:+.1}%)", value_ms, pct_change)
+                format!("{:.2} ({:+.1}%)", value_us, pct_change)
             }
         };
 
         rows.push(LatencyTable {
             name: name.to_string(),
-            p5_thin_ms: format_value(5.0, "thin"),
-            p25_thin_ms: format_value(25.0, "thin"),
-            p50_thin_ms: format_value(50.0, "thin"),
-            p90_thin_ms: format_value(90.0, "thin"),
-            p99_thin_ms: format_value(99.0, "thin"),
-            p5_fat_ms: format_value(5.0, "fat"),
-            p25_fat_ms: format_value(25.0, "fat"),
-            p50_fat_ms: format_value(50.0, "fat"),
-            p90_fat_ms: format_value(90.0, "fat"),
-            p99_fat_ms: format_value(99.0, "fat"),
-            mean_admit_delay_ms: format_mean("admit_delay"),
-            mean_start_delay_ms: format_mean("start_delay"),
-            mean_execution_time_ms: format_mean("execution_time"),
+            p5_thin_us: format_value(5.0, "thin"),
+            p50_thin_us: format_value(50.0, "thin"),
+            p90_thin_us: format_value(90.0, "thin"),
+            p99_thin_us: format_value(99.0, "thin"),
+            mean_thin_us: format_mean("thin"),
+            p5_fat_us: format_value(5.0, "fat"),
+            p50_fat_us: format_value(50.0, "fat"),
+            p90_fat_us: format_value(90.0, "fat"),
+            p99_fat_us: format_value(99.0, "fat"),
+            mean_fat_us: format_mean("fat"),
+            mean_admit_delay_us: format_mean("admit_delay"),
+            mean_start_delay_us: format_mean("start_delay"),
+            mean_execution_time_us: format_mean("execution_time"),
+            p50_execution_time_us: format_value(50.0, "execution_time"),
+            p90_execution_time_us: format_value(90.0, "execution_time"),
+            p99_execution_time_us: format_value(99.0, "execution_time"),
         });
     }
     let table = Table::builder(rows).index().column(0).transpose().build();
