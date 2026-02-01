@@ -9,7 +9,6 @@ use std::sync::Arc;
 pub struct TaskHeader<K: QueueKey> {
     id: TaskId,
     qid: K,
-    group: u64,
     // changes to true when task is enqueued
     // if this flag is true, it's not enqueued again
     queued: AtomicBool,
@@ -25,11 +24,10 @@ pub struct TaskHeader<K: QueueKey> {
 }
 
 impl<K: QueueKey> TaskHeader<K> {
-    pub fn new(id: TaskId, qid: K, group: u64, ingress_tx: Arc<Mpsc<TaskId>>) -> Self {
+    pub fn new(id: TaskId, qid: K, ingress_tx: Arc<Mpsc<TaskId>>) -> Self {
         Self {
             id,
             qid,
-            group,
             queued: AtomicBool::new(false),
             done: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -68,9 +66,6 @@ impl<K: QueueKey> TaskHeader<K> {
     #[inline]
     pub fn set_queued(&self, queued: bool) {
         self.queued.store(queued, Ordering::Release);
-    }
-    pub fn group(&self) -> u64 {
-        self.group
     }
 }
 

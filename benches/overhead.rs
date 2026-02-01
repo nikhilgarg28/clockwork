@@ -7,10 +7,7 @@
 //! - 1B: Yield/poll overhead (tasks that yield K times)
 //! - 1C: IO reactor integration (timer-based tasks)
 
-use clockworker::{
-    scheduler::{LAS, QLAS},
-    ExecutorBuilder,
-};
+use clockworker::ExecutorBuilder;
 use futures::future;
 use std::io::Write;
 use std::sync::Arc;

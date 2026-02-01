@@ -2,12 +2,9 @@
 
 ## ExecutorBuilder API
 
-The executor builder provides two methods for adding queues:
+The executor builder provides a simple method for adding queues:
 
-- `with_queue(qid, share)` - Creates a queue with the default RunnableFifo scheduler
-- `with_queue_scheduler(qid, share, scheduler)` - Creates a queue with a custom scheduler
-
-For most use cases, `with_queue()` is sufficient. Use `with_queue_scheduler()` when you need a specific scheduling algorithm (e.g., LAS, QLAS, QSRPT, FairSRPT).
+- `with_queue(qid, share)` - Creates a queue with FIFO task scheduling
 
 ## Running the Benchmarks
 
@@ -52,13 +49,10 @@ Results are printed to stdout and also saved to `benchmark_results.csv` for furt
 
 **Comparison**: 
 - Tokio (baseline)
-- Clockworker with default FIFO scheduler (simple FIFO, O(1) operations)
-- Clockworker with LAS (Least Attained Service, O(log n) operations)
+- Clockworker with FIFO scheduling (O(1) operations)
 
 **What to look for**:
-- Default FIFO scheduler should be close to Tokio
-- LAS will be slower (BTreeMap operations) - but how much?
-- If LAS is 10x slower, that's a concern
+- FIFO scheduling should be close to Tokio
 
 ### 1C: IO Reactor Integration
 
@@ -111,11 +105,12 @@ If you find high overhead:
    - Consider pre-allocation or arena allocation
 
 2. **High poll overhead (1B)**:
-   - LAS uses `BTreeMap` (O(log n)) - consider if simpler scheduling suffices
-   - Check `drain_ingress_into_classes` - is channel draining slow?
+   - Check if MPSC draining is slow
+   - Profile using `cargo flamegraph --bench poll_profile`
 
 3. **Reactor starvation (1C)**:
    - Increase `driver_yield` duration
+   - Decrease `max_polls_per_yield` to yield more frequently
    - Check if `yield_maybe` is being called frequently enough in long-running tasks
 
 ## Poll Profile Benchmark
@@ -135,7 +130,6 @@ cargo bench --bench poll_profile
 
 # Run with flamegraph (requires cargo-flamegraph: cargo install flamegraph)
 cargo flamegraph --bench poll_profile
-# Output: flamegraph.svg
 
 # Run with pprof (generates flamegraph.svg and profile.pb)
 # Note: On macOS, this may require running with sudo or may fail with SIGTRAP
@@ -147,14 +141,13 @@ PROFILE=pprof cargo bench --bench poll_profile
 - `N_TASKS`: Number of tasks to spawn (default: 10000)
 - `YIELDS_PER_TASK`: Number of yields per task (default: 100)
 - `EXECUTOR`: "clockworker" or "tokio" (default: "clockworker")
-- `SCHEDULER`: "fifo", "las", or "qlas" (default: "fifo", only for clockworker)
 - `PROFILE`: Set to "pprof" to enable pprof profiling
 
 **Examples**:
 
 ```bash
-# Profile Clockworker with LAS scheduler
-SCHEDULER=las cargo bench --bench poll_profile
+# Profile Clockworker
+cargo bench --bench poll_profile
 
 # Profile with more tasks/yields
 N_TASKS=50000 YIELDS_PER_TASK=200 cargo bench --bench poll_profile
@@ -163,13 +156,13 @@ N_TASKS=50000 YIELDS_PER_TASK=200 cargo bench --bench poll_profile
 EXECUTOR=tokio cargo bench --bench poll_profile
 
 # Generate pprof flamegraph
-PROFILE=pprof SCHEDULER=las cargo bench --bench poll_profile
+PROFILE=pprof cargo bench --bench poll_profile
 ```
 
 **Interpreting Results**:
 
 1. **Flamegraph**: Shows call stack and time spent in each function
-   - Look for hot paths in `poll_task`, `pop_next_task_from_queue`, scheduler operations
+   - Look for hot paths in `poll_task`, `pop_next_task_from_queue`, MPSC operations
    - Identify RefCell borrow overhead, stats recording, `Instant::now()` calls, etc.
    - Open `flamegraph.svg` in a web browser to explore
 
@@ -183,7 +176,7 @@ PROFILE=pprof SCHEDULER=las cargo bench --bench poll_profile
    If this happens, use `cargo flamegraph` instead (recommended for macOS).
 
 3. **Timing output**: Shows total time, polls/sec, and avg time per poll
-   - Compare different schedulers to see overhead differences
+   - Compare with Tokio baseline to see overhead
    - Use to validate optimizations
 
 **Troubleshooting pprof on macOS**:
@@ -204,7 +197,7 @@ If you get `SIGTRAP` errors when using pprof, pprof requires system-level profil
 
 3. **Use Instruments** (macOS native profiler):
    ```bash
-   xcrun xctrace record --template 'Time Profiler' \\
+   xcrun xctrace record --template 'Time Profiler' \
      --launch -- cargo bench --bench poll_profile
    ```
    Then open the trace in Instruments.app.

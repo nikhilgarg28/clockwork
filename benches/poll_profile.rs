@@ -17,12 +17,8 @@
 //!   N_TASKS: Number of tasks to spawn (default: 10000)
 //!   YIELDS_PER_TASK: Number of yields per task (default: 100)
 //!   EXECUTOR: "clockworker" or "tokio" (default: "clockworker")
-//!   SCHEDULER: "fifo", "las", or "qlas" (default: "fifo", only for clockworker)
 
-use clockworker::{
-    scheduler::{RunnableFifo, LAS, QLAS},
-    ExecutorBuilder,
-};
+use clockworker::ExecutorBuilder;
 use protobuf::Message as ProtoMessage;
 use std::env;
 use std::io::Write;
@@ -81,7 +77,6 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
     let executor_type = env::var("EXECUTOR").unwrap_or_else(|_| "clockworker".to_string());
-    let scheduler_type = env::var("SCHEDULER").unwrap_or_else(|_| "fifo".to_string());
     let use_pprof = env::var("PROFILE").map(|s| s == "pprof").unwrap_or(false);
 
     println!("Poll Overhead Profiling Benchmark");
@@ -90,9 +85,6 @@ fn main() {
     println!("Yields per task: {}", k);
     println!("Total polls: {}", n * (k + 1));
     println!("Executor: {}", executor_type);
-    if executor_type == "clockworker" {
-        println!("Scheduler: {}", scheduler_type);
-    }
     println!();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -137,27 +129,10 @@ fn main() {
         let local = LocalSet::new();
         let executor = match executor_type.as_str() {
             "clockworker" => {
-                let cw_executor = match scheduler_type.as_str() {
-                    "fifo" => ExecutorBuilder::new()
-                        .with_queue(0u8, 1)
-                        .build()
-                        .unwrap(),
-                    "las" => ExecutorBuilder::new()
-                        .with_queue_scheduler(0u8, 1, LAS::new())
-                        .build()
-                        .unwrap(),
-                    "qlas" => ExecutorBuilder::new()
-                        .with_queue_scheduler(0u8, 1, QLAS::new())
-                        .build()
-                        .unwrap(),
-                    _ => {
-                        eprintln!("Unknown scheduler: {}. Using FIFO.", scheduler_type);
-                        ExecutorBuilder::new()
-                            .with_queue(0u8, 1)
-                            .build()
-                            .unwrap()
-                    }
-                };
+                let cw_executor = ExecutorBuilder::new()
+                    .with_queue(0u8, 1)
+                    .build()
+                    .unwrap();
                 utils::Executor::start_clockworker(cw_executor, local).await
             }
             "tokio" => utils::Executor::start_tokio(local).await,

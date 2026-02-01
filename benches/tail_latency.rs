@@ -211,16 +211,7 @@ fn main() {
     let tokio_metrics = benchmark_tokio(spec.clone());
     println!(" done in {:?}", start.elapsed());
 
-    print!("Running clockworker benchmark(LAS)...");
-    std::io::stdout().flush().unwrap();
-    let executor = clockworker::ExecutorBuilder::new()
-        .with_queue_scheduler(0u8, 1, clockworker::scheduler::LAS::new())
-        .build()
-        .unwrap();
-    let start = Instant::now();
-    let clockworker_las_metrics = benchmark_clockworker(executor, spec.clone());
-    println!(" done in {:?}", start.elapsed());
-    print!("Running clockworker benchmark(Runnable FIFO)...");
+    print!("Running clockworker benchmark (FIFO)...");
     let executor = clockworker::ExecutorBuilder::new()
         .with_queue(0u8, 1)
         .build()
@@ -230,43 +221,9 @@ fn main() {
     let clockworker_fifo_metrics = benchmark_clockworker(executor, spec.clone());
     println!(" done in {:?}", start.elapsed());
 
-    print!("Running clockworker benchmark(QLAS)...");
-    let executor = clockworker::ExecutorBuilder::new()
-        .with_queue_scheduler(0u8, 1, clockworker::scheduler::QLAS::new())
-        .build()
-        .unwrap();
-    std::io::stdout().flush().unwrap();
-    let start = Instant::now();
-    let clockworker_qlas_metrics = benchmark_clockworker(executor, spec.clone());
-    println!(" done in {:?}", start.elapsed());
-
-    print!("Running clockworker benchmark(QSRPT)...");
-    let executor = clockworker::ExecutorBuilder::new()
-        .with_queue_scheduler(0u8, 1, clockworker::scheduler::QSRPT::new())
-        .build()
-        .unwrap();
-    std::io::stdout().flush().unwrap();
-    let start = Instant::now();
-    let clockworker_qsrpt_metrics = benchmark_clockworker(executor, spec.clone());
-    println!(" done in {:?}", start.elapsed());
-
-    print!("Running clockworker benchmark(FairSRPT)...");
-    let executor = clockworker::ExecutorBuilder::new()
-        .with_queue_scheduler(0u8, 1, clockworker::scheduler::FairSRPT::new())
-        .build()
-        .unwrap();
-    std::io::stdout().flush().unwrap();
-    let start = Instant::now();
-    let clockworker_fairsrpt_metrics = benchmark_clockworker(executor, spec.clone());
-    println!(" done in {:?}", start.elapsed());
-
     let results = vec![
         ("Tokio", tokio_metrics),
-        ("Clockworker(LAS)", clockworker_las_metrics),
-        ("Clockworker(Runnable FIFO)", clockworker_fifo_metrics),
-        ("Clockworker(QLAS)", clockworker_qlas_metrics),
-        ("Clockworker(QSRPT)", clockworker_qsrpt_metrics),
-        ("Clockworker(FairSRPT)", clockworker_fairsrpt_metrics),
+        ("Clockworker (FIFO)", clockworker_fifo_metrics),
     ];
     print_results(&results);
 }

@@ -2,7 +2,6 @@ use crate::{
     join::{JoinHandle, JoinState},
     mpsc::Mpsc,
     queue::{Queue, QueueKey, TaskId},
-    scheduler::Scheduler,
     stats::{ExecutorStats, QueueStats},
     task::TaskHeader,
     yield_once::yield_once,
@@ -17,9 +16,7 @@ use std::{
     cell::Cell,
     cell::RefCell,
     future::Future,
-    hash::{Hash, Hasher},
     mem,
-    num::NonZeroU64,
     pin::Pin,
     rc::Rc,
     sync::atomic::Ordering,
@@ -33,12 +30,6 @@ thread_local! {
 
 fn set_yield_maybe_deadline(deadline: Instant) {
     YIELD_MAYBE_DEADLINE.with(|cell| cell.set(Some(deadline)));
-}
-
-fn hash<H: std::hash::Hash>(h: H) -> u64 {
-    let mut hasher = ahash::AHasher::default();
-    h.hash(&mut hasher);
-    hasher.finish()
 }
 
 #[derive(Debug)]
@@ -161,17 +152,17 @@ struct TaskRecord<K: QueueKey> {
 struct QueueState<K: QueueKey> {
     vruntime: u128, // total CPU time consumed (in nanoseconds)
     share: u64,
-    scheduler: Box<dyn Scheduler>,
+    mpsc: Arc<Mpsc<TaskId>>,
     stats: QueueStats<K>,
 }
 
 impl<K: QueueKey> QueueState<K> {
-    fn new(queue: Queue<K>) -> Self {
+    fn new(queue: Queue<K>, mpsc: Arc<Mpsc<TaskId>>) -> Self {
         Self {
             vruntime: 0,
             stats: QueueStats::new(queue.id(), queue.share()),
             share: queue.share(),
-            scheduler: queue.scheduler(),
+            mpsc,
         }
     }
 }
@@ -179,34 +170,14 @@ impl<K: QueueKey> QueueState<K> {
 pub struct QueueHandle<K: QueueKey> {
     executor: Rc<Executor<K>>,
     qid: K,
-    hash: Option<NonZeroU64>,
 }
 impl<K: QueueKey> QueueHandle<K> {
-    pub fn group<H: Hash + std::fmt::Debug>(self: &Self, data: H) -> Self {
-        let hash = hash(data);
-        // set highest bit of hash to 1
-        let hash = hash | 1 << 63;
-        Self {
-            executor: self.executor.clone(),
-            qid: self.qid,
-            hash: Some(NonZeroU64::new(hash).unwrap()),
-        }
-    }
     pub fn spawn<T, F>(self: &Self, fut: F) -> JoinHandle<T, K>
     where
         T: 'static,
         F: Future<Output = T> + 'static, // !Send ok
     {
-        let group = match self.hash {
-            None => {
-                // take random 64 bits from a random number generator
-                let h = fastrand::u64(..);
-                let h = h & !(1 << 63);
-                h
-            }
-            Some(hash) => hash.get() as u64,
-        };
-        self.executor.spawn_inner(self.qid, group, fut)
+        self.executor.spawn_inner(self.qid, fut)
     }
 }
 
@@ -233,23 +204,12 @@ impl<K: QueueKey> ExecutorBuilder<K> {
         self.options.driver_yield = driver_yield;
         self
     }
-    /// Add a queue with a custom scheduler.
-    pub fn with_queue_scheduler<S: Scheduler + 'static>(
-        mut self,
-        qid: K,
-        share: u64,
-        scheduler: S,
-    ) -> Self {
-        let scheduler: Box<dyn Scheduler> = Box::new(scheduler);
-        let queue = Queue::new(qid, share, scheduler);
+
+    /// Add a queue with FIFO scheduling.
+    pub fn with_queue(mut self, qid: K, share: u64) -> Self {
+        let queue = Queue::new(qid, share);
         self.queues.push(queue);
         self
-    }
-
-    /// Add a queue with the default RunnableFifo scheduler.
-    pub fn with_queue(self, qid: K, share: u64) -> Self {
-        let scheduler = crate::scheduler::RunnableFifo::new();
-        self.with_queue_scheduler(qid, share, scheduler)
     }
     pub fn with_panic_on_task_panic(mut self, panic_on_task_panic: bool) -> Self {
         self.options.panic_on_task_panic = panic_on_task_panic;
@@ -257,7 +217,7 @@ impl<K: QueueKey> ExecutorBuilder<K> {
     }
     /// Set the maximum number of task polls before yielding to the driver.
     /// This ensures I/O-heavy workloads don't starve the reactor.
-    /// Default is 32.
+    /// Default is 61.
     pub fn with_max_polls_per_yield(mut self, max_polls: u32) -> Self {
         self.options.max_polls_per_yield = max_polls;
         self
@@ -334,13 +294,11 @@ impl<K: QueueKey> Executor<K> {
             (0..num_queues).map(|_| Arc::new(Mpsc::new())).collect();
 
         let qids = queues.iter().map(|q| q.id()).collect::<Vec<_>>();
-        let mut queues: Vec<QueueState<K>> =
-            queues.into_iter().map(|q| QueueState::new(q)).collect();
-
-        // Initialize each scheduler with its queue's mpsc
-        for (qidx, queue) in queues.iter_mut().enumerate() {
-            queue.scheduler.init(queue_mpscs[qidx].clone());
-        }
+        let queues: Vec<QueueState<K>> = queues
+            .into_iter()
+            .enumerate()
+            .map(|(idx, q)| QueueState::new(q, queue_mpscs[idx].clone()))
+            .collect();
 
         Ok(Rc::new(Self {
             queue_mpscs,
@@ -363,12 +321,11 @@ impl<K: QueueKey> Executor<K> {
         Ok(QueueHandle {
             executor: self.clone(),
             qid,
-            hash: None,
         })
     }
 
     /// Internal method to spawn a task onto a queue.
-    fn spawn_inner<T, F>(self: &Rc<Self>, qid: K, group: u64, fut: F) -> JoinHandle<T, K>
+    fn spawn_inner<T, F>(self: &Rc<Self>, qid: K, fut: F) -> JoinHandle<T, K>
     where
         T: 'static,
         F: Future<Output = T> + 'static, // !Send ok
@@ -383,12 +340,7 @@ impl<K: QueueKey> Executor<K> {
         let mut tasks = self.tasks.borrow_mut();
         let entry = tasks.vacant_entry();
         let id = entry.key();
-        let header = Arc::new(TaskHeader::new(
-            id,
-            qid,
-            group,
-            self.queue_mpscs[qidx].clone(),
-        ));
+        let header = Arc::new(TaskHeader::new(id, qid, self.queue_mpscs[qidx].clone()));
         let join = Arc::new(JoinState::<T>::new());
         // Wrap user future to publish result into JoinState.
         // catch_panics = !panic_on_task_panic (if executor panics on task panic, we don't catch)
@@ -422,7 +374,7 @@ impl<K: QueueKey> Executor<K> {
         let mut is_runnable = self.is_runnable.borrow_mut();
         for (idx, q) in self.queues.borrow_mut().iter_mut().enumerate() {
             let was_runnable = is_runnable[idx];
-            is_runnable[idx] = q.scheduler.is_runnable();
+            is_runnable[idx] = !q.mpsc.is_empty();
             if !was_runnable && is_runnable[idx] {
                 // wasn't runnable before, but is now - inherit vruntime
                 q.vruntime = q.vruntime.max(self.min_vruntime.get());
@@ -442,7 +394,7 @@ impl<K: QueueKey> Executor<K> {
             return Some((runnable.unwrap(), Duration::from_nanos(request as u64)));
         }
         for (idx, q) in self.queues.borrow().iter().enumerate() {
-            if !q.scheduler.is_runnable() {
+            if q.mpsc.is_empty() {
                 continue;
             }
             // d_i = vruntime_i + request / share_i
@@ -472,7 +424,7 @@ impl<K: QueueKey> Executor<K> {
             .queues
             .borrow()
             .iter()
-            .filter(|q| q.scheduler.is_runnable())
+            .filter(|q| !q.mpsc.is_empty())
             .map(|q| q.vruntime)
             .chain(Some(including))
             .min();
@@ -636,14 +588,14 @@ impl<K: QueueKey> Executor<K> {
     }
 
     /// Pop the next valid task from a queue, skipping stale/done tasks.
-    /// Returns (task id, group id)
-    fn pop_next_task_from_queue(&self, qidx: usize) -> Option<(TaskId, u64)> {
+    /// Returns task id
+    fn pop_next_task_from_queue(&self, qidx: usize) -> Option<TaskId> {
         loop {
             let mut queues = self.queues.borrow_mut();
             let queue = &mut queues[qidx];
             // Check if queue was runnable before pop (to detect when it becomes runnable)
             queue.stats.record_runnable_dequeue();
-            let maybe_id = queue.scheduler.pop();
+            let maybe_id = queue.mpsc.pop();
 
             drop(queues);
 
@@ -662,7 +614,7 @@ impl<K: QueueKey> Executor<K> {
                 continue;
             }
 
-            return Some((id, task.header.group()));
+            return Some(id);
         }
     }
 
@@ -731,36 +683,13 @@ impl<K: QueueKey> Executor<K> {
     }
 
     /// Complete a task that finished (Ready).
-    fn complete_task(&self, id: TaskId, qidx: usize, start: Instant, end: Instant) {
+    fn complete_task(&self, id: TaskId, _qidx: usize) {
         let mut tasks = self.tasks.borrow_mut();
         let task = tasks.get_mut(id).expect("task should exist");
-        let group = task.header.group();
         task.header.set_done();
         tasks.remove(id);
 
         self.live_tasks.fetch_sub(1, Ordering::Relaxed);
-
-        let mut queues = self.queues.borrow_mut();
-        let queue = &mut queues[qidx];
-        queue.scheduler.clear_task_state(id, group);
-        if group & (1 << 63) == 0 {
-            queue.scheduler.clear_group_state(group);
-        }
-        queue.scheduler.observe(id, group, start, end, true);
-    }
-
-    /// Record that a task is still pending.
-    fn record_task_pending(
-        &self,
-        id: TaskId,
-        group: u64,
-        qidx: usize,
-        start: Instant,
-        end: Instant,
-    ) {
-        let mut queues = self.queues.borrow_mut();
-        let queue = &mut queues[qidx];
-        queue.scheduler.observe(id, group, start, end, false);
     }
 
     /// Execute tasks from a selected queue until the timeslice is exhausted.
@@ -780,7 +709,7 @@ impl<K: QueueKey> Executor<K> {
         loop {
             set_yield_maybe_deadline(until);
 
-            let Some((id, group)) = self.pop_next_task_from_queue(qidx) else {
+            let Some(id) = self.pop_next_task_from_queue(qidx) else {
                 break; // Queue became empty
             };
 
@@ -788,9 +717,7 @@ impl<K: QueueKey> Executor<K> {
             let end = start + elapsed;
 
             if completed {
-                self.complete_task(id, qidx, start, end);
-            } else {
-                self.record_task_pending(id, group, qidx, start, end);
+                self.complete_task(id, qidx);
             }
             start = end;
             polls_this_slice += 1;
@@ -1100,113 +1027,6 @@ mod tests {
                     .await;
 
                 assert_eq!(counter.load(Ordering::Relaxed), 3);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_custom_policy_decision() {
-        // Create a custom policy that tracks which tasks are picked
-        struct Tracker {
-            ids: Vec<TaskId>,
-            enqueued: Arc<Mutex<Vec<(u64, TaskId)>>>,
-            picked: Arc<Mutex<Vec<(TaskId, bool)>>>,
-            mpsc: Option<Arc<crate::mpsc::Mpsc<TaskId>>>,
-        }
-
-        impl Scheduler for Tracker {
-            fn init(&mut self, mpsc: std::sync::Arc<crate::mpsc::Mpsc<TaskId>>) {
-                self.mpsc = Some(mpsc);
-            }
-            fn push(&mut self, id: TaskId, group: u64, _at: Instant) {
-                self.ids.push(id);
-                self.enqueued.lock().unwrap().push((group, id));
-            }
-            fn clear_task_state(&mut self, _id: TaskId, _group: u64) {}
-            fn clear_group_state(&mut self, _group: u64) {}
-
-            fn pop(&mut self) -> Option<TaskId> {
-                // try to pop from mpsc if available
-                if let Some(mpsc) = &self.mpsc {
-                    while let Some(id) = mpsc.pop() {
-                        self.ids.push(id);
-                        self.enqueued.lock().unwrap().push((0, id));
-                    }
-                }
-                // pick largest id
-                let id = self.ids.iter().max().copied();
-                if let Some(id) = id {
-                    self.ids.remove(id);
-                }
-                id
-            }
-
-            fn is_runnable(&self) -> bool {
-                if !self.ids.is_empty() {
-                    return true;
-                }
-                if let Some(mpsc) = &self.mpsc {
-                    return !mpsc.is_empty();
-                }
-                false
-            }
-
-            fn observe(
-                &mut self,
-                id: TaskId,
-                _gid: u64,
-                _start: Instant,
-                _end: Instant,
-                ready: bool,
-            ) {
-                self.picked.lock().unwrap().push((id, ready));
-            }
-        }
-
-        let local = LocalSet::new();
-        let enqueued = Arc::new(Mutex::new(Vec::new()));
-        let picked = Arc::new(Mutex::new(Vec::new()));
-        local
-            .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor = Executor::new(
-                    opts,
-                    vec![Queue::new(
-                        0,
-                        1,
-                        Box::new(Tracker {
-                            ids: Vec::new(),
-                            mpsc: None,
-                            picked: picked.clone(),
-                            enqueued: enqueued.clone(),
-                        }),
-                    )],
-                )
-                .unwrap();
-                let queue = executor.queue(0).unwrap();
-                let ran = executor
-                    .run_until(async {
-                        // Spawn tasks with different IDs
-                        for i in 0..3 {
-                            let _handle = queue.group(i % 2).spawn(async move {});
-                        }
-                        sleep(Duration::from_millis(200)).await;
-                        let picked = picked.lock().unwrap();
-                        assert_eq!(picked.len(), 3);
-                        // verify tasks are in reverse order of their IDs and are all ready
-                        assert!(picked[0].0 > picked[1].0 && picked[1].0 > picked[2].0);
-                        assert!(picked.iter().all(|(_, ready)| *ready));
-                        // also verify first and third tasks are in the same group but
-                        // second task is in a different group
-                        let enqueued = enqueued.lock().unwrap();
-                        assert_eq!(enqueued.len(), 3);
-                        assert_eq!(enqueued[0].0, enqueued[2].0);
-                        assert_ne!(enqueued[0].0, enqueued[1].0);
-                        true
-                    })
-                    .await;
-                assert!(ran);
             })
             .await;
     }

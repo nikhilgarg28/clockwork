@@ -7,7 +7,6 @@ mod yield_once;
 
 mod join;
 mod queue;
-pub mod scheduler;
 mod stats;
 mod task;
 
