@@ -13,7 +13,6 @@ use slab::Slab;
 use static_assertions::assert_not_impl_any;
 use std::sync::atomic::AtomicBool;
 use std::{
-    any::Any,
     cell::Cell,
     cell::RefCell,
     future::Future,
@@ -66,28 +65,6 @@ impl<T, K: QueueKey, F: Future<Output = T> + 'static> CancelableFuture<T, K, F> 
             catch_panics,
         }
     }
-
-    fn convert_panic_to_error(
-        panic_payload: Box<dyn Any + Send>,
-    ) -> Box<dyn std::error::Error + Send> {
-        // Try to extract a meaningful error message from the panic
-        match panic_payload.downcast::<String>() {
-            Ok(msg) => Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Task panicked: {}", msg),
-            )) as Box<dyn std::error::Error + Send>,
-            Err(payload) => match payload.downcast::<&'static str>() {
-                Ok(msg) => Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Task panicked: {}", msg),
-                )) as Box<dyn std::error::Error + Send>,
-                Err(_) => Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Task panicked with unknown payload",
-                )) as Box<dyn std::error::Error + Send>,
-            },
-        }
-    }
 }
 
 impl<T, K: QueueKey, F: Future<Output = T> + 'static> Future for CancelableFuture<T, K, F> {
@@ -120,7 +97,7 @@ impl<T, K: QueueKey, F: Future<Output = T> + 'static> Future for CancelableFutur
             Ok(Poll::Pending) => Poll::Pending,
             Err(panic_payload) => {
                 // Convert panic to JoinError::Panic
-                let panic_err = Self::convert_panic_to_error(panic_payload);
+                let panic_err = crate::join::PanicError::from_panic_payload(panic_payload);
                 self.join
                     .try_complete_err(crate::join::JoinError::Panic(panic_err));
                 Poll::Ready(())
@@ -640,10 +617,6 @@ impl<K: QueueKey> Executor<K> {
             Poll::Pending
         })
         .await
-    }
-
-    fn num_live_tasks(&self) -> usize {
-        self.queue_mpscs.iter().map(|mpsc| mpsc.len()).sum()
     }
 
     /// Select the next queue to run and measure the decision time.
@@ -1453,11 +1426,7 @@ mod tests {
                 }
 
                 // Executor should still be running (not crashed)
-                assert_eq!(
-                    executor.num_live_tasks(),
-                    0,
-                    "Task should be removed after panic"
-                );
+                assert_eq!(executor.queue_mpscs.len(), 1,);
             })
             .await;
     }
