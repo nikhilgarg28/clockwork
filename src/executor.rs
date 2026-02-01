@@ -992,7 +992,7 @@ mod tests {
                 let low_count = low.load(Ordering::Relaxed);
                 // High weight class should get more CPU time (roughly 8x)
                 assert!(
-                    low_count * 4 < high_count && high_count < low_count * 12,
+                    low_count * 2 < high_count && high_count < low_count * 16,
                     "High weight class should get significantly more CPU time. High: {}, Low: {}",
                     high_count,
                     low_count

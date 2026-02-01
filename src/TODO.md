@@ -18,7 +18,7 @@
 <!-- 16) dont' make spawn return error - if not accepting, make tasks canceled -->
 17) Option to enable stats
 <!-- 18) Configuration builder (e.g. sched_latency etc.) -->
-Remove mpsc2
+<!-- Remove mpsc2 -->
 <!-- Add method for with_queue and with_queue_having_scheduler -->
 Change tcp benchmark to not have handle.await and instead do shutdown signal
-Add fast path where there is only one queue - bypass vruntime etc.
+<!-- Add fast path where there is only one queue - bypass vruntime etc. -->

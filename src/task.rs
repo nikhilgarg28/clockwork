@@ -60,7 +60,7 @@ impl<K: QueueKey> TaskHeader<K> {
         if !self.queued.swap(true, Ordering::AcqRel) {
             // Unbounded send should not block.
             // If receiver is dropped, ignore.
-            let _ = self.ingress_tx.enqueue(self.id);
+            self.ingress_tx.push(self.id);
 
             // Check if this queue would preempt the currently running queue
             if let Some(preempt_state) = &self.preempt_state {

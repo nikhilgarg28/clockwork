@@ -2,7 +2,6 @@
 
 mod executor;
 mod mpsc;
-mod mpsc2;
 mod preempt;
 mod yield_once;
 
