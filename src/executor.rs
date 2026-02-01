@@ -254,9 +254,6 @@ pub struct Executor<K: QueueKey> {
     queue_mpscs: Vec<Arc<Mpsc<TaskId>>>,
     is_runnable: RefCell<Vec<bool>>, // true iff ith queue is runnable
 
-    /// Number of live tasks known to the executor.
-    live_tasks: std::sync::atomic::AtomicUsize,
-
     tasks: RefCell<Slab<TaskRecord<K>>>,
     queues: RefCell<Vec<QueueState<K>>>,
     qids: RefCell<Vec<K>>,
@@ -306,7 +303,6 @@ impl<K: QueueKey> Executor<K> {
             tasks: RefCell::new(Slab::new()),
             queues: RefCell::new(queues),
             qids: RefCell::new(qids),
-            live_tasks: std::sync::atomic::AtomicUsize::new(0),
             options,
             min_vruntime: std::cell::Cell::new(0),
             stats: RefCell::new(ExecutorStats::new(Instant::now())),
@@ -354,8 +350,6 @@ impl<K: QueueKey> Executor<K> {
             waker,
             fut: Box::pin(wrapped),
         });
-        // increment live tasks
-        self.live_tasks.fetch_add(1, Ordering::Relaxed);
 
         // Enqueue initially.
         header.enqueue();
@@ -688,8 +682,6 @@ impl<K: QueueKey> Executor<K> {
         let task = tasks.get_mut(id).expect("task should exist");
         task.header.set_done();
         tasks.remove(id);
-
-        self.live_tasks.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Execute tasks from a selected queue until the timeslice is exhausted.
