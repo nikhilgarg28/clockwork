@@ -16,6 +16,7 @@ use tokio::task::LocalSet;
 
 use crate::utils::{Step, Work};
 
+#[allow(dead_code)]
 mod utils;
 
 // ============================================================================

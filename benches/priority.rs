@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod utils;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -14,9 +15,7 @@ use utils::{Metrics, Step, Work};
 static CORE_IDS: OnceLock<Vec<core_affinity::CoreId>> = OnceLock::new();
 
 fn get_cached_core_ids() -> &'static Vec<core_affinity::CoreId> {
-    CORE_IDS.get_or_init(|| {
-        core_affinity::get_core_ids().unwrap_or_default()
-    })
+    CORE_IDS.get_or_init(|| core_affinity::get_core_ids().unwrap_or_default())
 }
 
 // ============================================================================
@@ -417,10 +416,7 @@ pub fn benchmark_two_runtime(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
     });
 
     // Spawn generator on a DIFFERENT core to avoid interference
-    let other_core = get_cached_core_ids()
-        .get(1)
-        .copied()
-        .unwrap_or(target_core); // Fall back if only one core
+    let other_core = get_cached_core_ids().get(1).copied().unwrap_or(target_core); // Fall back if only one core
 
     let gen_handle = {
         let count = spec.foreground_count;

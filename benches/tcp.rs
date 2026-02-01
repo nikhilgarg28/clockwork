@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod utils;
 use clockworker::ExecutorBuilder;
 use tokio::{

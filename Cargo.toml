@@ -1,6 +1,6 @@
 [package]
 name = "clockworker"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "A single-threaded async executor with EEVDF-based fair scheduling and pluggable task schedulers"
 license = "Apache-2.0"
@@ -11,15 +11,10 @@ keywords = ["async", "executor", "scheduler", "runtime", "tokio"]
 categories = ["asynchronous", "concurrency"]
 
 [dependencies]
-flume = "0.11"
 futures = "0.3"
 slab = "0.4"
 static_assertions = "1.1"
-ahash = "0.8"
-crossbeam-queue = "0.3"
 futures-util = "0.3"
-nohash-hasher = "0.2"
-fastrand = "2.0"
 
 [profile.release]
 debug = true
@@ -28,14 +23,11 @@ codegen-units = 1
 
 
 [dev-dependencies]
+flume = "0.11"
 tokio = { version = "1", features = ["full", "time", "rt", "macros"] }
 monoio = { version = "0.2" }
 smol = { version = "2.0" }
-hdrhistogram = "7.0"
-async-recursion = "1.1"
 tabled = "0.20"
-pprof = { version = "0.15", features = ["flamegraph", "protobuf-codec"] }
-protobuf = "3.7.2"
 rand = { version = "0.8", features = ["std"] }
 core_affinity = "0.8"
 libc = "0.2"
@@ -45,11 +37,7 @@ name = "overhead"
 harness = false
 
 [[bench]]
-name = "tail_latency"
-harness = false
-
-[[bench]]
-name = "poll_profile"
+name = "tail"
 harness = false
 
 [[bench]]

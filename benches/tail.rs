@@ -2,6 +2,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tabled::Table;
+#[allow(dead_code)]
 mod utils;
 use utils::{Executor, Metrics, Work, WorkSpec};
 
@@ -223,7 +224,7 @@ fn main() {
 
     let results = vec![
         ("Tokio", tokio_metrics),
-        ("Clockworker (FIFO)", clockworker_fifo_metrics),
+        ("Clockworker", clockworker_fifo_metrics),
     ];
     print_results(&results);
 }
