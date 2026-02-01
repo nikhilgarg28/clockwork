@@ -8,7 +8,7 @@ async runtime and can sit on top of any runtime like Tokio, Monoio, or Smol.
 
 ## What is Clockworker for?
 
-There is a class of settings where single-threaded async runtimes are a great fit.
+Single-threaded async runtimes are a great fit for a class of problems.
 Several such runtimes exist in the Rust ecosystem—Tokio, Monoio, Glommio, etc. But
 almost none of these (with the exception of Glommio) provide the ability to run
 multiple configurable work queues with different priorities. This becomes important
@@ -26,6 +26,8 @@ is designed to sit on top of any other runtime.
 ## Features
 
 - **EEVDF-based queue scheduling**: Fair CPU time distribution between queues using virtual runtime (inspired by Linux CFS/EEVDF)
+- **Premption**: If a queue becomes runnable while the timeslice of another lower
+ priority queue is being executed, the timeslice is preempted at the next poll
 - **FIFO task ordering**: Tasks within each queue execute in FIFO order
 - **Task cancellation**: Abort running tasks via `JoinHandle::abort()`
 - **Panic handling**: Configurable panic behavior (propagate or catch as `JoinError::Panic`)
@@ -37,7 +39,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clockworker = "0.1.0"
+clockworker = "0.2.0"
 ```
 
 ## Examples
@@ -101,8 +103,8 @@ async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
         // Create executor with two queues:
-        // - Foreground: weight 8 (gets 8/9 of CPU time)
-        // - Background: weight 1 (gets 1/9 of CPU time)
+        // - Foreground: weight 9 (gets 9/10 of CPU time)
+        // - Background: weight 1 (gets 1/10 of CPU time)
         // Note: Queue IDs can be enums (as shown here) or integers, strings, or any
         // type implementing QueueKey
         let executor = ExecutorBuilder::new()
@@ -146,7 +148,7 @@ async fn main() {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }).await;
 
-        // After running for a bit, high_count should be ~8x low_count
+        // After running for a bit, high_count should be ~9x low_count
         println!("High: {}, Low: {}",
                  high_count.load(Ordering::Relaxed),
                  low_count.load(Ordering::Relaxed));
@@ -238,7 +240,7 @@ async fn main() {
 
 ## Architecture
 
-Clockworker uses a single-level scheduling approach based on EEVDF:
+Clockworker uses a two-level scheduling approach based on EEVDF:
 
 1. **Queue-level scheduling (EEVDF)**: Fairly distributes CPU time between queues based on their weights using virtual runtime
 2. **Task-level scheduling (FIFO)**: Within each queue, tasks execute in FIFO order
@@ -249,32 +251,62 @@ This design allows you to:
 
 ## Benchmarks
 
-Clockworker includes several benchmarks to evaluate performance:
+**Setup**
 
-- **overhead**: Measures executor overhead
-- **tail_latency**: Measures tail latency under various loads
-- **poll_profile**: Profiles polling behavior
-- **priority**: Tests priority queue behavior (Linux-specific)
+Foreground tasks are generated at RPS of 1K/sec, each doing 1-3 yields - at each
+yield point, the task does variable (100-500us) of cpu work and a variable (100-500us)
+of sleep. In addition, some background tasks (0 or 8) are also generated that do 
+similar amount of cpu work and sleep. Background tasks, when present, have enough
+CPU work in aggregate to saturate the CPU.
 
-### Running Benchmarks on Linux (via Docker)
+The workload runs on a single thread pinned to a core while the work generation
+happens on another thread/core. Two latencies are measured: a) time from task
+generation to task starting (i.e. queue delay) b) end to end time from task 
+generation to task finishing (i.e. total latency). In addition, the amount of
+background work done is also measured.
 
-Some benchmarks use Linux-specific features (e.g., `libc::setpriority`, io_uring). To run these on macOS or any platform, use Docker:
 
-```bash
-# Build the Docker image
-make docker-build
+The benchmark compares five options:
+1. Tokio single threaded runtime with only foreground tasks (baseline)
+2. Tokio single threaded runtime with both foreground & background tasks
+3. Clockworker executor on top of tokio single threaded runtime with only foreground tasks
+4. Same as #3 above but with both foreground/background tasks.
+5. Two separate single threaded tokio runtimes - one for background and one for
+foreground (no coordination between them)
 
-# Run the priority benchmark
-make docker-run-priority
+**Results**
+|       Metric       |    Tokio (fg only)     |       CW (fg+bg)       |      CW (fg only)      |     Tokio (fg+bg)      |       Two-RT/OS        |
+|--------------------|------------------------|------------------------|------------------------|------------------------|------------------------|
+|  p50 queue delay   |         0.40ms         |      0.41ms (+2%)      |      0.38ms (-5%)      |    8.33ms (+1982%)     |     0.49ms (+22%)      |
+|  p90 queue delay   |         1.23ms         |      1.18ms (-4%)      |      1.20ms (-2%)      |    12.05ms (+880%)     |     1.39ms (+13%)      |
+|  p99 queue delay   |         2.19ms         |      2.18ms (-0%)      |      2.18ms (-0%)      |    15.89ms (+626%)     |     2.52ms (+15%)      |
+| p50 total latency  |         2.44ms         |      2.37ms (-3%)      |      2.46ms (+1%)      |    14.78ms (+506%)     |      2.56ms (+5%)      |
+| p90 total latency  |         4.65ms         |      4.53ms (-3%)      |      4.71ms (+1%)      |    24.23ms (+421%)     |      4.83ms (+4%)      |
+| p99 total latency  |         6.16ms         |      6.11ms (-1%)      |      6.30ms (+2%)      |    31.60ms (+413%)     |      6.63ms (+8%)      |
+|   BG throughput    |           0            |          1299          |           0            |          1337          |          1299          |
 
-# Run all benchmarks
-make docker-run-all
+**Interpretation**
+1. Clockworker adds negligible overhead and with foreground only tasks, is competitive
+   with singel threaded tokio runtime.
+2. With Tokio runtime, foreground latency degrades 4-5x with background tasks.
+3. With Clockworker executor, background tasks don't impact the foreground latency 
+   at all - and the performance is competitive with tokio foreground only
+4. Adding two-runtimes is also competitive from latency POV
+5. All three options with background tasks are comparable in terms of the volume
+   of the background work done.
 
-# Or use docker directly
-docker run clockworker-bench priority
-```
+## Clockworker vs Multiple Runtimes
 
-See [README_DOCKER.md](README_DOCKER.md) for detailed Docker usage instructions.
+While running multiple runtimes, one for each priority queue, is competitive
+with Clockworker as shown in above benchmarks, there are a few other benefits
+of using clockworker:
+1. Less complexity - it's some additional work to setup & maintain multiple runtimes
+   (e.g. graceful shutdowns, sharing stats etc.)
+2. Clockworkes works with !Send and !Sync futures - no need for Arc/Mutex etc. This both
+   improves ergonomics and may also show up as overhead depending on the application 
+   (not tested in the benchmarks)
+3. It's non-trivial to setup multiple runtimes in platform agnostic way (e.g. CPU
+    affinity works differently on Mac vs Linux)
 
 ## Requirements
 

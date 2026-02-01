@@ -118,7 +118,7 @@ def format_value(value: Optional[float], metric: str, baseline: Optional[float] 
         elif pct_change < 0:
             formatted += f" ({pct_change:.0f}%)"
         else:
-            formatted += " (baseline)"
+            formatted += " (0%)"
 
     return formatted
 
