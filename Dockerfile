@@ -16,8 +16,15 @@ COPY Cargo.toml Cargo.lock* README.md ./
 COPY src ./src
 COPY benches ./benches
 
-# Build the benchmarks in release mode
-RUN cargo build --release --bench priority
+# Build all benchmarks in release mode
+RUN cargo build --release --bench priority --bench tcp
 
-# Default command runs the priority benchmark
-CMD ["cargo", "bench", "--bench", "priority", "--", "--nocapture"]
+# Copy and make entrypoint script executable
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Use entrypoint script to handle benchmark selection
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# Default to priority benchmark if no argument provided
+CMD ["priority"]

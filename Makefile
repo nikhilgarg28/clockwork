@@ -18,6 +18,9 @@ docker-build: ## Build the Docker image for running benchmarks
 docker-run-priority: ## Run the priority benchmark in Docker
 	docker run --rm $(IMAGE_NAME) priority
 
+docker-run-tcp: ## Run the TCP benchmark in Docker
+	docker run --rm $(IMAGE_NAME) tcp
+
 docker-run-all: ## Run all benchmarks in Docker
 	docker run --rm $(IMAGE_NAME) all
 
